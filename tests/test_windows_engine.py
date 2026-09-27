@@ -141,3 +141,41 @@ def test_invalidated_leg_is_dropped_and_reopened_without_starving_the_rest(monke
     monkeypatch.setattr(e, "_open_leg", lambda device_id: fresh)
     e._reconcile()
     assert e._legs["dead"] is fresh
+
+
+def test_leg_that_fails_to_open_is_retried_once_a_second(monkeypatch):
+    import pipemix.windows.wasapi.engine as engine_mod
+
+    clock = [100.0]
+    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock[0])
+    e = Engine("src")
+    e.set_legs(["busy"])
+    attempts = []
+
+    def _open(device_id):
+        attempts.append(clock[0])
+        if len(attempts) == 1:
+            raise OSError(-2004287478, "device in use")  # AUDCLNT_E_DEVICE_IN_USE
+        return _FakeLeg(device_id)
+    monkeypatch.setattr(e, "_open_leg", _open)
+
+    e._reconcile()                     # fails
+    clock[0] += 0.5
+    e._reconcile()                     # too soon: not tried again
+    assert attempts == [100.0]
+    assert "busy" not in e._legs
+
+    clock[0] += 0.6
+    e._reconcile()                     # a second on: tried and opened
+    assert len(attempts) == 2
+    assert "busy" in e._legs
+
+
+def test_retry_is_forgotten_when_the_leg_is_no_longer_wanted(monkeypatch):
+    e = Engine("src")
+    e.set_legs(["gone"])
+    monkeypatch.setattr(e, "_open_leg", lambda d: (_ for _ in ()).throw(OSError("nope")))
+    e._reconcile()
+    e.set_legs([])
+    e._reconcile()
+    assert not e._retry_at

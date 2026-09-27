@@ -41,6 +41,7 @@ POLL_MS       = 5    # how often the pump looks at the source and the legs
 BUFFER_MS     = 200  # endpoint buffer we ask Windows for, source and legs alike
 DRIFT_MS      = 20   # how far a leg may fall behind before we drop frames
 DRIFT_KEEP_MS = 5    # what we leave queued after dropping
+LEG_RETRY_S   = 1.0  # how long a leg that failed to open waits before the next try
 
 
 class _Leg:
@@ -101,6 +102,7 @@ class Engine:
 
         self._wanted: set[str] = set()
         self._legs: dict[str, _Leg] = {}
+        self._retry_at: dict[str, float] = {}  # monotonic time a failed leg may be tried again
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
         self._ready  = threading.Event()
@@ -322,15 +324,24 @@ class Engine:
         with self._lock:
             wanted = set(self._wanted)
 
+        now = time.monotonic()
+        for device_id in list(self._retry_at):
+            if device_id not in wanted:
+                del self._retry_at[device_id]
+
         for device_id in wanted - set(self._legs):
+            if now < self._retry_at.get(device_id, now):
+                continue
             try:
                 self._legs[device_id] = self._open_leg(device_id)
+                self._retry_at.pop(device_id, None)
             except Exception as e:
                 # One dead endpoint must not take the others down, and must not
-                # be retried every 5 ms.
-                log.error("Engine could not open leg %s: %s", device_id, e)
-                with self._lock:
-                    self._wanted.discard(device_id)
+                # be retried every 5 ms. It stays wanted, though: an endpoint
+                # held in exclusive mode, or mid profile switch, comes back.
+                (log.debug if device_id in self._retry_at else log.error)(
+                    "Engine could not open leg %s: %s", device_id, e)
+                self._retry_at[device_id] = now + LEG_RETRY_S
 
         for device_id in set(self._legs) - wanted:
             self._close_leg(self._legs.pop(device_id))
@@ -364,7 +375,7 @@ class Engine:
                 # An endpoint can be invalidated without going away (a format
                 # change, a Bluetooth profile switch). Drop that leg so it
                 # can't starve the others; it stays wanted, so the next
-                # reconcile reopens it, or gives up on it if that fails.
+                # reconcile reopens it, retrying once a second if that fails.
                 log.warning("Engine leg %s failed, reopening: %s", device_id, e)
                 self._close_leg(self._legs.pop(device_id))
 
