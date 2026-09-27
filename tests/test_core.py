@@ -101,11 +101,13 @@ def _loaded(loads: list[list[str]], *frags: str) -> bool:
 
 def test_leg_delays(monkeypatch) -> None:
     # wired reports 0 ns, bt reports 200 ms — pw-dump is the only source of truth.
-    monkeypatch.setattr(pactl_backend, "_run", lambda args: (
+    loads: list[list[str]] = []
+    # Module list: load n got id n; pw-dump for everything else.
+    monkeypatch.setattr(pactl_backend, "_run", lambda args: (0, "".join(
+        f"{i}\t{c[0]}\t{' '.join(c[1:])}\n" for i, c in enumerate(loads, 1)
+    ), "") if args[-1] == "modules" else (
         0, json.dumps([_pw_node("wired", 0), _pw_node("bt", 200_000_000)]), ""
     ))
-
-    loads: list[list[str]] = []
     ids = iter(range(1, 100))
     monkeypatch.setattr(pactl_backend, "_load", lambda args: (loads.append(args), next(ids))[1])
     unloads: list[int] = []
@@ -119,17 +121,17 @@ def test_leg_delays(monkeypatch) -> None:
 
     # 1. one device (plus a disconnected one, which must be ignored) → base delay
     backend.set_legs(sink, [wired, ghost])
-    assert _loaded(loads, "sink=wired", "latency_msec=60")
-    assert sink.delays["wired"] == 60
+    assert _loaded(loads, "sink=wired", "latency_msec=30")
+    assert sink.delays["wired"] == 30
     assert None not in sink.legs
 
     # 2. a slower device joins: the fast leg reloads to match it, old module unloaded
     wired_module = sink.legs["wired"]
     backend.set_legs(sink, [wired, bt])
     assert unloads == [wired_module]
-    assert _loaded(loads, "sink=wired", "latency_msec=260")
-    assert _loaded(loads, "sink=bt", "latency_msec=260")
-    assert sink.delays == {"wired": 260, "bt": 260}
+    assert _loaded(loads, "sink=wired", "latency_msec=230")
+    assert _loaded(loads, "sink=bt", "latency_msec=230")
+    assert sink.delays == {"wired": 230, "bt": 230}
 
     # 3. high-water mark: dropping bt unloads it but does not pull wired back down
     bt_module = sink.legs["bt"]
@@ -137,7 +139,7 @@ def test_leg_delays(monkeypatch) -> None:
     backend.set_legs(sink, [wired])
     assert len(loads) == n_loads, "wired must not reload"
     assert unloads == [wired_module, bt_module]
-    assert sink.delays["wired"] == 260
+    assert sink.delays["wired"] == 230
     assert "bt" not in sink.legs
 
 
@@ -153,7 +155,7 @@ def test_leg_delays_pw_dump_fails(monkeypatch) -> None:
     bt = AudioDevice("b", "BT", "bt", DeviceKind.BLUETOOTH)
 
     backend.set_legs(sink, [wired, bt])
-    assert sink.delays == {"wired": 60, "bt": 60}
+    assert sink.delays == {"wired": 30, "bt": 30}
 
 
 def test_latencies_malformed_json(monkeypatch) -> None:
@@ -182,13 +184,13 @@ def test_leg_delays_transient_failure(monkeypatch) -> None:
     bt = AudioDevice("b", "BT", "bt", DeviceKind.BLUETOOTH)
 
     backend.set_legs(sink, [wired, bt])
-    assert sink.delays == {"wired": 260, "bt": 260}
+    assert sink.delays == {"wired": 230, "bt": 230}
 
     monkeypatch.setattr(pactl_backend, "_run", lambda args: (1, "", "pw-dump timed out"))
     n_loads = len(loads)
     backend.set_legs(sink, [wired, bt])
     assert len(loads) == n_loads, "already-aligned legs must not reload on a transient failure"
-    assert sink.delays == {"wired": 260, "bt": 260}
+    assert sink.delays == {"wired": 230, "bt": 230}
 
 
 def test_device_identity() -> None:
