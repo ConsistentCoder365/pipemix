@@ -24,11 +24,15 @@ export interface AudioDevice {
   // Added by Api.devices_payload, not on the dataclass.
   selected: boolean;
   target: boolean; // in the live session, even if it dropped out
+  primary: boolean; // the elected leader in leader mode; meaningless otherwise
 }
 
 export interface BackendStatus {
   health: BackendHealth;
   message: string;
+  // "native" | "hub" | "leader" — set by WasapiBackend.health(); absent only
+  // from App.tsx's placeholder state before the first snapshot lands.
+  engine?: string;
 }
 
 export interface Stream {
@@ -37,6 +41,7 @@ export interface Stream {
   sink: string;
   mute: boolean;
   devices: string[] | null; // pinned device ids; null while following the session
+  stuck: boolean; // playing somewhere other than where it was routed — the app has to reopen its audio
 }
 
 export interface Preset {
