@@ -357,8 +357,16 @@ class Engine:
                     leg.push(data)
             self._capture.ReleaseBuffer(frames)
 
-        for leg in self._legs.values():
-            leg.write()
+        for device_id, leg in list(self._legs.items()):
+            try:
+                leg.write()
+            except Exception as e:
+                # An endpoint can be invalidated without going away (a format
+                # change, a Bluetooth profile switch). Drop that leg so it
+                # can't starve the others; it stays wanted, so the next
+                # reconcile reopens it, or gives up on it if that fails.
+                log.warning("Engine leg %s failed, reopening: %s", device_id, e)
+                self._close_leg(self._legs.pop(device_id))
 
     def _close(self) -> None:
         for leg in list(self._legs.values()):
