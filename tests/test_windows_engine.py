@@ -98,3 +98,46 @@ def test_com_interfaces_declared():
     assert com.IActivateAudioInterfaceAsyncOperation is not None
     assert com.IActivateAudioInterfaceCompletionHandler is not None
     assert com.IAgileObject is not None
+
+
+# -- A dead leg must not starve the others --------------------------------
+
+class _NoCapture:
+    def GetNextPacketSize(self):
+        return 0
+
+
+class _FakeLeg:
+    def __init__(self, device_id, fail=False):
+        self.id, self.fail, self.writes = device_id, fail, 0
+        self.client = self
+
+    def push(self, data):
+        pass
+
+    def write(self):
+        if self.fail:
+            # AUDCLNT_E_DEVICE_INVALIDATED, as on a Bluetooth profile switch
+            raise OSError(-2004287484, "device invalidated")
+        self.writes += 1
+
+    def Stop(self):
+        pass
+
+
+def test_invalidated_leg_is_dropped_and_reopened_without_starving_the_rest(monkeypatch):
+    e = Engine("src")
+    e._capture = _NoCapture()
+    dead, alive = _FakeLeg("dead", fail=True), _FakeLeg("alive")
+    e._legs = {"dead": dead, "alive": alive}  # the dead one first, so it would block the other
+    e.set_legs(["dead", "alive"])
+
+    e._pump()
+
+    assert alive.writes == 1
+    assert "dead" not in e._legs
+
+    fresh = _FakeLeg("dead")
+    monkeypatch.setattr(e, "_open_leg", lambda device_id: fresh)
+    e._reconcile()
+    assert e._legs["dead"] is fresh
