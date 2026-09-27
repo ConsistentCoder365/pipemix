@@ -277,6 +277,42 @@ def test_set_master_volume_without_unmute_does_not_touch_mute(tmp_path: Path) ->
     b.set_volume.assert_called_once_with(ctrl.active_sink(), 60)
 
 
+def test_streams_and_route_stream_speak_the_api_shape(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [{"id": 42, "name": "App", "sink": "EP1", "mute": False}]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+
+    assert ctrl.streams()[0]["devices"] is None
+    ctrl.route_stream(42, [d2.id])
+    b.move_stream.assert_called_with(42, "EP2")
+    assert ctrl.streams()[0]["devices"] == ["EP2"]
+
+    try:
+        ctrl.route_stream(42, [d1.id, d2.id])
+        raise AssertionError("fan-out per app should be refused")
+    except BackendError:
+        pass
+
+    ctrl.route_stream(42, None)                 # back to the session / default
+    b.move_stream.assert_called_with(42, "prev_default")
+    assert ctrl.streams()[0]["devices"] is None
+
+
+def test_start_and_stop_push_devices_so_the_page_sees_targets(tmp_path: Path) -> None:
+    ctrl = _ctrl(tmp_path, backend=_backend(engine="hub"))
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+    pushed = []
+    ctrl.connect("devices-changed", lambda _c, devs: pushed.append(set(ctrl.targets)))
+
+    ctrl.start_sharing([d1])
+    assert pushed[-1] == {"EP1"}
+    ctrl.stop_sharing()
+    assert pushed[-1] == set()
+
+
 if __name__ == "__main__":
     import tempfile
 

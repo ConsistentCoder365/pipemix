@@ -31,7 +31,7 @@ import time
 from typing import TYPE_CHECKING
 
 from pipemix.models import AudioDevice, SessionState, SharingSession, VirtualSink
-from pipemix.linux.services.backend import BackendHealth
+from pipemix.linux.services.backend import BackendError, BackendHealth
 from pipemix.linux.services.config.config_manager import ConfigManager
 from pipemix.windows.signal import SignalEmitter
 from pipemix.windows.wasapi.notify import DeviceMonitor
@@ -172,6 +172,9 @@ class Controller(SignalEmitter):
 
             self.devices = found
             self.emit("devices-changed", list(found.values()))
+            # ponytail: no session notifications on Windows yet, so the app list
+            # only updates here; hook IAudioSessionNotification for live updates.
+            self.emit("streams-changed", self.streams())
 
         except Exception as e:
             log.error("Failed to refresh devices: %s", e)
@@ -350,11 +353,36 @@ class Controller(SignalEmitter):
         """Record who the session is for, now that the routing matches."""
         self.session.devices = devices
         self.targets = {d.id for d in devices}
+        # The page reads who is in the session off each device.
+        self.emit("devices-changed", list(self.devices.values()))
         self._set_state(SessionState.ACTIVE)
 
-    def route_stream(self, stream_id: int, target: str) -> None:
+    def streams(self) -> list[dict]:
+        """What is playing, each with the device it was pinned to (None: following)."""
+        live = self.backend.list_streams()
+        ids = {s["id"] for s in live}
+        for sid in [s for s in self.overrides if s not in ids]:
+            del self.overrides[sid]
+        return [
+            {**s, "devices": [self.overrides[s["id"]]] if s["id"] in self.overrides else None}
+            for s in live
+        ]
+
+    @locked
+    def route_stream(self, stream_id: int, ids: list[str] | None) -> None:
+        """Pin a stream to one device, or hand it back to the session with None."""
+        devs = [d for d in (self.devices.get(i) for i in ids or []) if d and d.sink]
+        # ponytail: one engine per session, so no per-app fan-out; add a second
+        # engine per pinned app if routing one app to several outputs matters.
+        if len(devs) > 1:
+            raise BackendError("On Windows an app can be routed to one output at a time.")
+
+        target = devs[0].sink if devs else self.active_sink() or self.backend.get_default()
         self.backend.move_stream(stream_id, target)
-        self.overrides[stream_id] = target
+        if devs:
+            self.overrides[stream_id] = devs[0].id
+        else:
+            self.overrides.pop(stream_id, None)
         log.info("Manual route: stream %d → %s", stream_id, target)
 
     @locked
@@ -376,6 +404,7 @@ class Controller(SignalEmitter):
             self.session.devices = []
             self.targets.clear()
             self.overrides.clear()
+            self.emit("devices-changed", list(self.devices.values()))
             self._set_state(SessionState.IDLE)
         except Exception as e:
             log.error("Error while stopping session: %s", e)
