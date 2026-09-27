@@ -371,3 +371,15 @@ def test_destroy_sink_never_raises_when_clearing_a_route_fails(monkeypatch):
 
     assert b._routed == set()
     assert b._hub is None
+
+
+# -- move_stream(pid, None) clears the pin through the router --
+
+def test_move_stream_with_none_clears_the_pin(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    fake_router = _FakeAppRouter()
+    b._app_router = fake_router
+
+    b.move_stream(1, None)
+
+    assert (1, None) in fake_router.calls

@@ -279,7 +279,9 @@ def test_set_master_volume_without_unmute_does_not_touch_mute(tmp_path: Path) ->
 
 def test_streams_and_route_stream_speak_the_api_shape(tmp_path: Path) -> None:
     b = _backend(engine="hub")
-    b.list_streams.return_value = [{"id": 42, "name": "App", "sink": "EP1", "mute": False}]
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
     ctrl = _ctrl(tmp_path, backend=b)
     d1, d2 = _dev("EP1"), _dev("EP2")
     ctrl.devices = {d.id: d for d in (d1, d2)}
@@ -295,9 +297,162 @@ def test_streams_and_route_stream_speak_the_api_shape(tmp_path: Path) -> None:
     except BackendError:
         pass
 
-    ctrl.route_stream(42, None)                 # back to the session / default
-    b.move_stream.assert_called_with(42, "prev_default")
+    ctrl.route_stream(42, None)                 # clear the pin
+    b.move_stream.assert_called_with(42, None)
     assert ctrl.streams()[0]["devices"] is None
+
+# -- Stuck: PipeMix accepted a route, but the app hasn't reopened its audio --
+
+def test_stuck_pinned_app_playing_on_the_wrong_endpoint(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "endpoint": "EP1", "active": True,
+         "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.route_stream(42, [d2.id])              # pinned to EP2, still playing on EP1
+
+    assert ctrl.streams()[0]["stuck"] is True
+
+    b.list_streams.return_value[0]["endpoint"] = "EP2"
+    assert ctrl.streams()[0]["stuck"] is False
+
+
+def test_stuck_unpinned_app_while_sharing_follows_the_hub(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    hub = ctrl.active_sink()
+
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "C:\\App.exe"},
+    ]
+    assert ctrl.streams()[0]["stuck"] is False
+
+    b.list_streams.return_value[0]["endpoint"] = "EP1"
+    assert ctrl.streams()[0]["stuck"] is True
+
+
+def test_stuck_never_true_without_an_active_stream_or_session(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "endpoint": "EP1", "active": False,
+         "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    ctrl.route_stream(42, [d2.id])
+
+    # Pinned elsewhere, session up, but the stream itself is idle.
+    assert ctrl.streams()[0]["stuck"] is False
+
+    # No session and no pin: nothing to expect, so nothing is stuck either.
+    ctrl2 = _ctrl(tmp_path / "idle", backend=_backend(engine="hub"))
+    ctrl2.backend.list_streams.return_value = [
+        {"id": 7, "name": "App2", "sink": "EP1", "endpoint": "EP1", "active": True,
+         "mute": False, "exe": "C:\\App2.exe"},
+    ]
+    assert ctrl2.streams()[0]["stuck"] is False
+
+
+
+# -- Per-app pins: no blanket move_streams, and pins are tracked by exe --
+
+def test_start_sharing_never_calls_move_streams(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+
+    ctrl.start_sharing([d1])
+
+    b.move_streams.assert_not_called()
+
+
+def test_route_stream_records_and_clears_pinned_app(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+
+    ctrl.route_stream(42, [d2.id])
+    assert ctrl.config.data["pinned_apps"] == ["C:\\App.exe"]
+
+    ctrl.route_stream(42, None)
+    assert ctrl.config.data["pinned_apps"] == []
+
+
+def test_stop_sharing_unpins_a_live_pinned_app(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    ctrl.route_stream(42, [d2.id])
+    assert ctrl.config.data["pinned_apps"] == ["C:\\App.exe"]
+    b.move_stream.reset_mock()
+
+    ctrl.stop_sharing()
+
+    b.move_stream.assert_called_with(42, None)
+    assert ctrl.config.data["pinned_apps"] == []
+
+
+def test_pinned_app_survives_until_seen_again_under_a_new_pid(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    ctrl.route_stream(42, [d2.id])
+
+    b.list_streams.return_value = []            # the app closed before stop_sharing
+    ctrl.stop_sharing()
+    assert ctrl.config.data["pinned_apps"] == ["C:\\App.exe"]  # no live pid to clear it through
+
+    # It reopens under a new pid.
+    b.list_streams.return_value = [
+        {"id": 99, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    b.move_stream.reset_mock()
+    ctrl.streams()
+
+    b.move_stream.assert_called_with(99, None)
+    assert ctrl.config.data["pinned_apps"] == []
+
+
+def test_streams_does_not_sweep_a_currently_overridden_app(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    ctrl.route_stream(42, [d2.id])
+    b.move_stream.reset_mock()
+
+    ctrl.streams()
+
+    b.move_stream.assert_not_called()
+    assert ctrl.config.data["pinned_apps"] == ["C:\\App.exe"]
 
 
 def test_start_and_stop_push_devices_so_the_page_sees_targets(tmp_path: Path) -> None:
