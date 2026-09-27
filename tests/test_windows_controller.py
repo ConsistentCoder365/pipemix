@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from pipemix.models import AudioDevice, DeviceKind, SessionState, VirtualSink
 from pipemix.linux.services.backend import BackendError, BackendHealth, BackendStatus
 from pipemix.linux.services.config.config_manager import ConfigManager
+from pipemix.windows import controller as controller_module
 from pipemix.windows.controller import Controller
 
 
@@ -393,7 +394,10 @@ def test_route_stream_records_and_clears_pinned_app(tmp_path: Path) -> None:
 
 
 def test_stop_sharing_unpins_a_live_pinned_app(tmp_path: Path) -> None:
-    b = _backend(engine="hub")
+    # Leader mode, not hub: under contract D a hub-mode route_stream with an
+    # active session no longer pins at all (it fans out via overrides), so
+    # this pin-lifecycle test moves to the mode that still pins.
+    b = _leader_backend()
     b.list_streams.return_value = [
         {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
     ]
@@ -412,7 +416,8 @@ def test_stop_sharing_unpins_a_live_pinned_app(tmp_path: Path) -> None:
 
 
 def test_pinned_app_survives_until_seen_again_under_a_new_pid(tmp_path: Path) -> None:
-    b = _backend(engine="hub")
+    # Leader mode: see the comment on test_stop_sharing_unpins_a_live_pinned_app.
+    b = _leader_backend()
     b.list_streams.return_value = [
         {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
     ]
@@ -438,7 +443,8 @@ def test_pinned_app_survives_until_seen_again_under_a_new_pid(tmp_path: Path) ->
 
 
 def test_streams_does_not_sweep_a_currently_overridden_app(tmp_path: Path) -> None:
-    b = _backend(engine="hub")
+    # Leader mode: see the comment on test_stop_sharing_unpins_a_live_pinned_app.
+    b = _leader_backend()
     b.list_streams.return_value = [
         {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
     ]
@@ -466,6 +472,246 @@ def test_start_and_stop_push_devices_so_the_page_sees_targets(tmp_path: Path) ->
     assert pushed[-1] == {"EP1"}
     ctrl.stop_sharing()
     assert pushed[-1] == set()
+
+
+# -- Contract D: per-app capture in hub mode (PER-APP-ROUTING.md Phase 1) --
+#
+# In hub mode a session no longer pins apps at all: route_stream just records
+# which device ids an app wants (`overrides`), and `_sync_apps` reconciles
+# that against `backend.set_app_routes({pid: [device ids]})` on its own —
+# directly (tests below call it), or off the 1 s poll thread while a hub
+# session is active. Leader mode is untouched and keeps the pin path.
+
+def test_hub_route_stream_fans_out_without_pinning(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    hub = ctrl.active_sink()
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "C:\\App.exe"},
+    ]
+
+    ctrl.route_stream(42, [d1.id, d2.id])
+
+    b.move_stream.assert_not_called()                  # no pin — a live fan-out
+    assert set(ctrl.overrides[42]) == {d1.id, d2.id}
+
+    b.set_app_routes.reset_mock()
+    ctrl._sync_apps()
+
+    assert b.set_app_routes.call_count == 1
+    routes = b.set_app_routes.call_args[0][0]
+    assert set(routes[42]) == {d1.id, d2.id}
+
+
+def test_hub_route_stream_none_falls_back_to_session_devices(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    hub = ctrl.active_sink()
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl.route_stream(42, [d1.id])
+    assert ctrl.overrides.get(42) == [d1.id]
+
+    ctrl.route_stream(42, None)                         # clear the override
+
+    assert 42 not in ctrl.overrides
+    b.set_app_routes.reset_mock()
+    ctrl._sync_apps()
+
+    routes = b.set_app_routes.call_args[0][0]
+    assert set(routes[42]) == {d1.id, d2.id}            # follows every session device
+
+
+def test_sync_apps_only_routes_active_streams_on_the_hub(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    hub = ctrl.active_sink()
+    b.list_streams.return_value = [
+        {"id": 1, "name": "OnHub", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "a.exe"},
+        {"id": 2, "name": "Idle", "sink": hub, "endpoint": hub, "active": False,
+         "mute": False, "exe": "b.exe"},
+        {"id": 3, "name": "Elsewhere", "sink": "EP1", "endpoint": "EP1", "active": True,
+         "mute": False, "exe": "c.exe"},
+    ]
+    b.set_app_routes.reset_mock()
+
+    ctrl._sync_apps()
+
+    routes = b.set_app_routes.call_args[0][0]
+    assert set(routes.keys()) == {1}
+
+
+def test_sync_apps_emits_streams_changed_only_on_change(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+    ctrl.start_sharing([d1])
+    hub = ctrl.active_sink()
+    b.list_streams.return_value = [
+        {"id": 1, "name": "App", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "a.exe"},
+    ]
+    seen = []
+    ctrl.connect("streams-changed", lambda _c, out: seen.append(out))
+
+    ctrl._sync_apps()
+    assert len(seen) == 1
+
+    ctrl._sync_apps()                                   # nothing changed
+    assert len(seen) == 1
+
+    b.list_streams.return_value[0]["active"] = False
+    ctrl._sync_apps()
+    assert len(seen) == 2
+
+
+def test_stuck_in_hub_mode_ignores_overrides(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    hub = ctrl.active_sink()
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": hub, "endpoint": hub, "active": True,
+         "mute": False, "exe": "a.exe"},
+    ]
+    ctrl.route_stream(42, [d2.id])                       # overridden to EP2 only
+
+    # Still playing into the hub, which is exactly right in hub mode — the
+    # override is a capture-side routing choice, not where the app must play.
+    assert ctrl.streams()[0]["stuck"] is False
+
+    b.list_streams.return_value[0]["endpoint"] = "EP1"   # bypassed the hub entirely
+    assert ctrl.streams()[0]["stuck"] is True
+
+
+def test_leader_mode_route_stream_still_pins_and_rejects_fanout(tmp_path: Path) -> None:
+    b = _leader_backend()
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2, d3 = _dev("EP1"), _dev("EP2"), _dev("EP3")
+    ctrl.devices = {d.id: d for d in (d1, d2, d3)}
+    ctrl.start_sharing([d1, d2, d3])
+
+    ctrl.route_stream(42, [d2.id])
+
+    b.move_stream.assert_called_with(42, "EP2")
+    assert ctrl.overrides[42] == [d2.id]
+
+    try:
+        ctrl.route_stream(42, [d2.id, d3.id])
+        raise AssertionError("fan-out per app should still be refused in leader mode")
+    except BackendError:
+        pass
+
+
+def test_hub_route_stream_clears_a_leftover_pinned_apps_entry(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    # A pin left behind by a previous idle/leader-mode run, keyed by exe —
+    # `streams()` would normally learn `_exe` itself, but this test only
+    # needs the leftover-pin-clearing branch, so it seeds it directly.
+    ctrl.config.data["pinned_apps"] = ["C:\\App.exe"]
+    ctrl._exe[42] = "C:\\App.exe"
+
+    ctrl.route_stream(42, [d2.id])
+
+    b.move_stream.assert_called_with(42, None)
+    assert ctrl.config.data["pinned_apps"] == []
+
+
+def test_on_disconnect_drops_device_from_override_lists(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    # Both pids must stay live, or streams() prunes their overrides first.
+    b.list_streams.return_value = [
+        {"id": 42, "name": "A", "sink": "EP1", "mute": False, "exe": "C:\\A.exe"},
+        {"id": 43, "name": "B", "sink": "EP1", "mute": False, "exe": "C:\\B.exe"},
+    ]
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2, d3 = _dev("EP1"), _dev("EP2"), _dev("EP3")
+    ctrl.devices = {d.id: d for d in (d1, d2, d3)}
+    ctrl.start_sharing([d1, d2, d3])
+    ctrl.overrides[42] = [d1.id, d2.id]
+    ctrl.overrides[43] = [d1.id]
+    b.set_app_routes.reset_mock()
+
+    ctrl._on_disconnect(d1.id)
+
+    assert ctrl.overrides[42] == [d2.id]
+    assert 43 not in ctrl.overrides                      # emptied out entirely
+    b.set_app_routes.assert_called()                     # re-synced after the drop
+
+
+def test_retarget_resyncs_apps(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1])
+    b.set_app_routes.reset_mock()
+
+    ctrl.start_sharing([d1, d2])                         # session already up -> _retarget
+
+    b.set_app_routes.assert_called()
+
+
+def test_start_sharing_hub_starts_the_poll_thread(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+
+    ctrl.start_sharing([d1])
+
+    assert ctrl._app_poll is not None and ctrl._app_poll.is_alive()
+
+    ctrl.stop_sharing()
+
+    assert ctrl._app_poll_stop is not None and ctrl._app_poll_stop.is_set()
+
+
+def test_sync_apps_noop_after_stop_sharing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(controller_module, "APP_POLL_S", 999)
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+    ctrl.start_sharing([d1])
+    ctrl.stop_sharing()
+    b.set_app_routes.reset_mock()
+
+    ctrl._sync_apps()
+
+    b.set_app_routes.assert_not_called()
 
 
 if __name__ == "__main__":

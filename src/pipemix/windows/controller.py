@@ -19,6 +19,10 @@ Forked from `pipemix.linux.controller`. What changed and why:
 - New: leader re-election. In leader mode the source endpoint is a real
   device that can vanish; `_on_disconnect` elects a survivor and rebuilds the
   session on it. Hub mode has no leader, so this path never triggers there.
+- New: per-app capture in hub mode. While a hub session is up, a 1 s poll
+  (`_sync_apps`) hands `backend.set_app_routes` every app playing into the
+  hub with the outputs it wants, so one app can go to several outputs and
+  nothing is pinned. Leader mode keeps the per-app pin path.
 """
 
 from __future__ import annotations
@@ -40,6 +44,9 @@ if TYPE_CHECKING:
     from pipemix.windows.backend import WasapiBackend
 
 log = logging.getLogger(__name__)
+
+# How often a hub-mode session reconciles per-app captures with what is playing.
+APP_POLL_S = 1.0
 
 
 def locked(fn):
@@ -69,8 +76,15 @@ class Controller(SignalEmitter):
         # Endpoint ids we want back if they reconnect mid-session.
         self.targets: set[str] = set()
 
-        # Streams the user routed by hand, so a rebuild does not drag them back.
-        self.overrides: dict[int, str] = {}
+        # Streams the user routed by hand (pid -> device ids), so a rebuild
+        # does not drag them back.
+        self.overrides: dict[int, list[str]] = {}
+
+        # Hub-mode app poll: the thread, the event that stops it, and the
+        # last app list pushed to the page.
+        self._app_poll: threading.Thread | None = None
+        self._app_poll_stop: threading.Event | None = None
+        self._last_streams: list[dict] | None = None
 
         # Last known exe per stream pid, so a pin can be recorded/cleared in
         # config.data["pinned_apps"] by exe even after the pid exits.
@@ -109,6 +123,7 @@ class Controller(SignalEmitter):
         else:
             # Pins made while idle are still ours to undo on the way out.
             self.overrides.clear()
+            self._last_streams = None
             try:
                 self._sweep_pins(self.backend.list_streams())
             except Exception as e:
@@ -190,8 +205,8 @@ class Controller(SignalEmitter):
 
             self.devices = found
             self.emit("devices-changed", list(found.values()))
-            # ponytail: no session notifications on Windows yet, so the app list
-            # only updates here; hook IAudioSessionNotification for live updates.
+            # No session notifications on Windows yet: outside a hub session the
+            # app list only updates here (a hub session also polls, `_sync_apps`).
             self.emit("streams-changed", self.streams())
 
         except Exception as e:
@@ -323,6 +338,9 @@ class Controller(SignalEmitter):
             self.session.sink = self._route(devices)
             self._adopt(devices)
             log.info("Session active: %s", self.active_sink())
+            if self.backend.health().engine == "hub":
+                self._sync_apps()
+                self._start_app_poll()
         except Exception as e:
             log.error("Failed to start session: %s", e)
             self._set_state(SessionState.ERROR)
@@ -360,6 +378,7 @@ class Controller(SignalEmitter):
         self.backend.set_legs(self.session.sink, devices)
         self._level_hub(self.session.sink.name, devices)
         self._adopt(devices)
+        self._sync_apps()
 
     def _prepare(self, devices: list[AudioDevice]) -> None:
         """Unmute each output and put it back at its own level."""
@@ -380,7 +399,7 @@ class Controller(SignalEmitter):
         self._set_state(SessionState.ACTIVE)
 
     def streams(self) -> list[dict]:
-        """What is playing, each with the device it was pinned to (None: following)."""
+        """What is playing, each with the devices it was routed to (None: following)."""
         live = self.backend.list_streams()
         ids = {s["id"] for s in live}
         for s in live:
@@ -389,10 +408,15 @@ class Controller(SignalEmitter):
         for sid in [s for s in self.overrides if s not in ids]:
             del self.overrides[sid]
         self._sweep_pins(live)
+        hub = self.session.is_active and self.backend.health().engine == "hub"
         out = []
         for s in live:
-            if s["id"] in self.overrides:
-                target = self.devices.get(self.overrides[s["id"]])
+            if hub:
+                # In hub mode an override is a capture-side choice: the app
+                # should still play into the hub, whatever it is routed to.
+                expected = self.active_sink()
+            elif s["id"] in self.overrides:
+                target = self.devices.get(self.overrides[s["id"]][0])
                 expected = target.sink if target else None
             elif self.session.is_active:
                 expected = self.active_sink()
@@ -404,10 +428,45 @@ class Controller(SignalEmitter):
             stuck = bool(s.get("active") and expected and s.get("endpoint") != expected)
             out.append({
                 **s,
-                "devices": [self.overrides[s["id"]]] if s["id"] in self.overrides else None,
+                "devices": list(self.overrides[s["id"]]) if s["id"] in self.overrides else None,
                 "stuck": stuck,
             })
         return out
+
+    @locked
+    def _sync_apps(self) -> None:
+        """Hand the backend every app playing into the hub, with the outputs
+        it wants (its override, else every session device), and push the app
+        list to the page when it changed. Hub mode only. Never raises."""
+        # ponytail: 1 s poll; IAudioSessionNotification if the delay before a new app is heard matters.
+        try:
+            if not (self.session.is_active and self.session.sink
+                    and self.backend.health().engine == "hub"):
+                return
+            out = self.streams()
+            hub = self.active_sink()
+            session_ids = [d.id for d in self.session.devices]
+            routes = {
+                s["id"]: self.overrides.get(s["id"]) or session_ids
+                for s in out if s.get("active") and s.get("endpoint") == hub
+            }
+            self.backend.set_app_routes(routes)
+            if out != self._last_streams:
+                self._last_streams = out
+                self.emit("streams-changed", out)
+        except Exception as e:
+            log.warning("Failed to sync per-app routes: %s", e)
+
+    def _start_app_poll(self) -> None:
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.wait(APP_POLL_S):
+                self._sync_apps()
+
+        self._app_poll_stop = stop
+        self._app_poll = threading.Thread(target=run, name="pipemix-app-poll", daemon=True)
+        self._app_poll.start()
 
     def _sweep_pins(self, live: list[dict]) -> None:
         """Clear pins PipeMix left behind: an exe in `pinned_apps` with no
@@ -435,20 +494,39 @@ class Controller(SignalEmitter):
 
     @locked
     def route_stream(self, stream_id: int, ids: list[str] | None) -> None:
-        """Pin a stream to one device, or clear the pin with None — the app
-        then follows the machine default (the hub, while a session is up)."""
+        """Route a stream to some outputs, or clear the route with None.
+
+        In a hub-mode session this only records the override and reconciles:
+        the app keeps playing into the hub and is captured out to each of its
+        devices (None: every session device). Otherwise it pins the app to
+        one device, and None lets it follow the machine default again."""
         devs = [d for d in (self.devices.get(i) for i in ids or []) if d and d.sink]
-        # ponytail: one engine per session, so no per-app fan-out; add a second
-        # engine per pinned app if routing one app to several outputs matters.
+        exe = self._exe.get(stream_id)
+        pinned = self.config.data["pinned_apps"]
+
+        if self.session.is_active and self.backend.health().engine == "hub":
+            if devs:
+                self.overrides[stream_id] = [d.id for d in devs]
+            else:
+                self.overrides.pop(stream_id, None)
+            # A pin left from idle or leader mode would pull the app off the hub.
+            if exe and exe in pinned:
+                self.backend.move_stream(stream_id, None)
+                pinned.remove(exe)
+                self.config.save()
+            log.info("Manual route: stream %d → %s", stream_id, [d.id for d in devs] or "session")
+            self._sync_apps()
+            return
+
+        # ponytail: leader mode has no silent sink to capture apps from, so it
+        # keeps one pin per app; revisit if per-app fan-out matters there.
         if len(devs) > 1:
             raise BackendError("On Windows an app can be routed to one output at a time.")
 
         target = devs[0].sink if devs else None
         self.backend.move_stream(stream_id, target)
-        exe = self._exe.get(stream_id)
-        pinned = self.config.data["pinned_apps"]
         if devs:
-            self.overrides[stream_id] = devs[0].id
+            self.overrides[stream_id] = [devs[0].id]
             if exe and exe not in pinned:
                 pinned.append(exe)
                 self.config.save()
@@ -462,6 +540,9 @@ class Controller(SignalEmitter):
     @locked
     def stop_sharing(self) -> None:
         self._set_state(SessionState.STOPPING)
+        # Never join here: the poll thread may be waiting on this very lock.
+        if self._app_poll_stop:
+            self._app_poll_stop.set()
         try:
             if self.prev_default:
                 try:
@@ -478,6 +559,7 @@ class Controller(SignalEmitter):
             self.session.devices = []
             self.targets.clear()
             self.overrides.clear()
+            self._last_streams = None
             try:
                 self._sweep_pins(self.backend.list_streams())
             except Exception as e:
@@ -510,10 +592,17 @@ class Controller(SignalEmitter):
             dev.sink = None
         self.emit("devices-changed", list(self.devices.values()))
 
-        for sid in [s for s, sink in self.overrides.items() if sink == device_id]:
-            del self.overrides[sid]
+        for sid, ids in list(self.overrides.items()):
+            if device_id in ids:
+                ids = [i for i in ids if i != device_id]
+                if ids:
+                    self.overrides[sid] = ids
+                else:
+                    del self.overrides[sid]
 
         if not (self.session.is_active and device_id in self.targets):
+            # It may still have been an app's override target.
+            self._sync_apps()
             return
 
         log.warning("An active sharing device (%s) disconnected.", device_id)
@@ -542,6 +631,8 @@ class Controller(SignalEmitter):
 
         log.info("Continuing on: %s", [d.name for d in remaining])
         self._set_state(SessionState.ACTIVE)
+        # After ACTIVE: `_sync_apps` does nothing while the session repairs.
+        self._sync_apps()
 
     def _reelect_leader(self) -> None:
         """

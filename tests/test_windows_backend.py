@@ -67,18 +67,29 @@ def _dev(id_: str, name: str = "Dev", connected: bool = True) -> AudioDevice:
 
 
 class _FakeEngine:
-    """Stands in for wasapi.engine.Engine: records legs, never touches COM."""
+    """Stands in for wasapi.engine.Engine: records legs, never touches COM.
+
+    `fail_start_pids` is a class-level set a test fills in before calling
+    `set_app_routes`, so `start()` raises for those pids only — the same
+    per-test knob `_FakeAppRouter.fail_clear` already uses below.
+    """
 
     instances: list["_FakeEngine"] = []
+    fail_start_pids: set[int] = set()
 
-    def __init__(self, source_id: str) -> None:
+    def __init__(self, source_id: str | None = None, *, pid: int | None = None) -> None:
+        if (source_id is None) == (pid is None):
+            raise ValueError("exactly one of source_id/pid is required")
         self.source_id = source_id
+        self.pid = pid
         self.started = False
         self.stopped = False
         self._legs: list[str] = []
         _FakeEngine.instances.append(self)
 
     def start(self) -> None:
+        if self.pid is not None and self.pid in _FakeEngine.fail_start_pids:
+            raise RuntimeError(f"could not activate process loopback for pid {self.pid}")
         self.started = True
 
     def stop(self) -> None:
@@ -111,6 +122,7 @@ class _FakeAppRouter:
 def _backend(monkeypatch, *, hub: bool = False, default: str | None = None) -> WasapiBackend:
     """A backend with the engine and every wasapi.* call faked."""
     _FakeEngine.instances = []
+    _FakeEngine.fail_start_pids = set()
     monkeypatch.setattr(backend_mod, "Engine", _FakeEngine)
 
     # list_outputs takes include_virtual: the cable is hidden from the outputs
@@ -215,13 +227,16 @@ def test_leader_mode_excludes_leader_from_legs(monkeypatch):
     assert b.leader == "dev_a"
 
 
-def test_hub_mode_includes_every_selected_device_as_a_leg(monkeypatch):
+def test_hub_mode_creates_no_engine_and_covers_every_device_in_legs(monkeypatch):
+    # Phase 1: hub create_sink no longer starts a CABLE Output engine at all —
+    # per-app routing replaces it (see set_app_routes below). sink.module is
+    # None, but sink.legs still lists every selected device, matching what
+    # the Apps tab / UI reads off the session regardless of engine mode.
     b = _backend(monkeypatch, hub=True, default="original")
     devices = [_dev("dev_a"), _dev("dev_b")]
     sink = b.create_sink(devices)
-    engine = sink.module
-    assert engine.source_id == "cable_out"
-    assert engine.legs == ["dev_a", "dev_b"]
+    assert sink.module is None
+    assert _FakeEngine.instances == []
     assert sink.legs == {"dev_a": 0, "dev_b": 0}
     assert b.leader is None
 
@@ -383,3 +398,146 @@ def test_move_stream_with_none_clears_the_pin(monkeypatch):
     b.move_stream(1, None)
 
     assert (1, None) in fake_router.calls
+
+
+# -- Phase 1 per-app routing: leader mode is unchanged --
+
+def test_leader_mode_still_starts_exactly_one_engine(monkeypatch):
+    b = _backend(monkeypatch, hub=False, default="dev_a")
+    devices = [_dev("dev_a"), _dev("dev_b")]
+    b.create_sink(devices)
+    assert len(_FakeEngine.instances) == 1
+    assert _FakeEngine.instances[0].source_id == "dev_a"
+
+
+# -- set_app_routes: one Engine(pid=...) per app actively playing into the
+# hub, reconciled against whatever routes the Controller asks for this poll --
+
+def test_set_app_routes_starts_one_engine_per_new_pid(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a", "dev_b"]})
+    assert len(_FakeEngine.instances) == 1
+    engine = _FakeEngine.instances[0]
+    assert engine.pid == 1
+    assert engine.started is True
+    assert engine.legs == ["dev_a", "dev_b"]
+
+
+def test_set_app_routes_same_routes_again_creates_nothing_new(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a"]})
+    assert len(_FakeEngine.instances) == 1
+
+    b.set_app_routes({1: ["dev_a"]})
+
+    assert len(_FakeEngine.instances) == 1  # no second Engine() built
+
+
+def test_set_app_routes_changed_ids_calls_set_legs_on_the_same_engine(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a"]})
+    engine = _FakeEngine.instances[0]
+
+    b.set_app_routes({1: ["dev_a", "dev_b"]})
+
+    assert len(_FakeEngine.instances) == 1  # same engine, not recreated
+    assert engine.legs == ["dev_a", "dev_b"]
+
+
+def test_set_app_routes_ignores_leg_order_when_comparing_ids(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a", "dev_b"]})
+    engine = _FakeEngine.instances[0]
+    engine.set_legs = lambda ids: (_ for _ in ()).throw(
+        AssertionError("set_legs must not be called when the id set is unchanged")
+    )
+
+    b.set_app_routes({1: ["dev_b", "dev_a"]})  # same set, different order
+
+
+def test_set_app_routes_dropped_pid_stops_its_engine(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a"], 2: ["dev_b"]})
+    engine1, engine2 = _FakeEngine.instances
+
+    b.set_app_routes({2: ["dev_b"]})
+
+    assert engine1.stopped is True
+    assert engine2.stopped is False
+
+    # Re-adding pid 1 later must start a *new* engine, not reuse the stopped one.
+    b.set_app_routes({1: ["dev_a"], 2: ["dev_b"]})
+    assert len(_FakeEngine.instances) == 3
+
+
+def test_set_app_routes_unchanged_pid_touches_nothing(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    b.set_app_routes({1: ["dev_a"]})
+    engine = _FakeEngine.instances[0]
+    engine.set_legs = lambda ids: (_ for _ in ()).throw(
+        AssertionError("set_legs must not be called when routes are unchanged")
+    )
+
+    b.set_app_routes({1: ["dev_a"]})  # identical routes — must not touch set_legs
+
+
+def test_set_app_routes_a_failing_pid_is_logged_and_others_still_start(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    _FakeEngine.fail_start_pids = {1}
+
+    b.set_app_routes({1: ["dev_a"], 2: ["dev_b"]})  # must not raise
+
+    started_pids = {e.pid for e in _FakeEngine.instances if e.started}
+    assert started_pids == {2}
+
+
+def test_set_app_routes_a_failed_pid_is_not_retried_while_still_requested(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    _FakeEngine.fail_start_pids = {1}
+    b.set_app_routes({1: ["dev_a"]})
+    assert len(_FakeEngine.instances) == 1  # one attempt
+
+    b.set_app_routes({1: ["dev_a"]})  # same route requested again
+    assert len(_FakeEngine.instances) == 1  # not retried
+
+    b.set_app_routes({})  # pid leaves the routes entirely
+    _FakeEngine.fail_start_pids = set()  # now it would succeed
+    b.set_app_routes({1: ["dev_a"]})  # requested again -> a fresh attempt
+    assert len(_FakeEngine.instances) == 2
+
+
+def test_destroy_sink_stops_every_app_engine(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    sink = b.create_sink([_dev("dev_a")])
+    b.set_app_routes({1: ["dev_a"], 2: ["dev_a"]})
+    app_engines = list(_FakeEngine.instances)
+    assert len(app_engines) == 2
+
+    b.destroy_sink(sink)
+
+    assert all(e.stopped for e in app_engines)
+
+
+def test_destroy_sink_never_raises_when_an_app_engine_stop_fails(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    sink = b.create_sink([_dev("dev_a")])
+    b.set_app_routes({1: ["dev_a"], 2: ["dev_a"]})
+    engine1, engine2 = _FakeEngine.instances
+
+    def _boom():
+        raise RuntimeError("endpoint already gone")
+    engine1.stop = _boom
+
+    b.destroy_sink(sink)  # must not raise
+
+    assert engine2.stopped is True
+
+
+def test_set_legs_on_a_hub_sink_with_no_engine_module_works(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    sink = b.create_sink([_dev("dev_a")])
+    assert sink.module is None
+
+    b.set_legs(sink, [_dev("dev_a"), _dev("dev_b")])  # must not raise
+
+    assert sink.legs == {"dev_a": 0, "dev_b": 0}
