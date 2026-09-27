@@ -32,10 +32,9 @@ CABLE_OUTPUT_HINT = "CABLE Output"
 def _capture_endpoints() -> list[tuple[str, str]]:
     """[(endpoint id, friendly name)] for every active capture endpoint.
 
-    `wasapi/devices.py` only enumerates render endpoints (Phase 1 only needed
-    outputs); the VB-CABLE probe needs the capture flow too, so this asks
-    pycaw for it directly rather than growing devices.py a flow argument for
-    one caller.
+    `wasapi/devices.py` only enumerates render endpoints; the VB-CABLE probe
+    needs the capture flow too, so this asks pycaw for it directly rather
+    than growing devices.py a flow argument for one caller.
     """
     from pycaw.constants import DEVICE_STATE, EDataFlow
     from pycaw.utils import AudioUtilities
@@ -156,41 +155,6 @@ class WasapiBackend:
         except Exception as e:
             raise BackendError(f"Failed to list streams: {e}") from e
 
-    def move_streams(self, target: str, exclude: list[int] | None = None) -> None:
-        """
-        Route every active app to `target`, except those in `exclude`.
-
-        Unlike `pactl move-sink-input`, which moves a live stream, this sets a
-        *persisted preference* per app — some applications only pick it up the
-        next time they open an audio stream.
-        """
-        if not self._app_router.available:
-            log.warning("Per-app routing unavailable — skipping routing.")
-            return
-
-        try:
-            streams = self.list_streams()
-        except BackendError as e:
-            log.warning("Could not list streams — skipping routing: %s", e)
-            return
-
-        if not streams:
-            log.info("No active streams to route.")
-            return
-
-        skip = set(exclude or [])
-        moved = 0
-        for s in streams:
-            if s["id"] in skip:
-                continue
-            try:
-                self._route_stream(s["id"], target)
-                moved += 1
-            except Exception as e:
-                log.warning("Failed to move stream %d: %s", s["id"], e)
-
-        log.info("Moved %d/%d stream(s) to %s", moved, len(streams), target)
-
     def move_stream(self, stream_id: int, target: str | None) -> None:
         """
         Route one app to `target`, or clear its pin with None so the app
@@ -239,12 +203,8 @@ class WasapiBackend:
         echo. Either way the previous default is remembered so `destroy_sink`
         can restore it.
 
-        Switching the Windows default to `sink.name` is the Controller's job,
-        not done here, exactly as on Linux. Doing it here too meant it ran
-        *before* `Controller._level_hub` had set the level, so the first
-        moment of audio could arrive at whatever volume that endpoint
-        happened to be sitting at — which is the very thing the comment in
-        `_route` warns about.
+        The Controller switches the Windows default to `sink.name`, after it
+        has set the level.
         """
         if not devices:
             raise BackendError("No devices selected.")
@@ -270,14 +230,8 @@ class WasapiBackend:
 
         self._hub = hub_id
 
-        # `name` is the endpoint everything plays *into* — CABLE Input in hub
-        # mode, the leader in leader mode. On Linux that slot holds the null
-        # sink's name, which pactl accepts as a target for set-default-sink,
-        # set-sink-volume and move-sink-input alike. The Controller uses it the
-        # same way here (`active_sink()`), so it has to name a real endpoint;
-        # a `pipemix_<uuid>` label would be meaningless to WASAPI. Nothing on
-        # Windows needs the generated name — it exists on Linux so crash
-        # recovery can spot our orphans, and Windows leaks no sinks to spot.
+        # `name` is the endpoint everything plays into, because the
+        # Controller passes it to set_default/set_volume.
         sink = VirtualSink(engine, hub_id)
         log.info("Created session on %s (%s engine)", sink.name, self._status.engine)
         self.set_legs(sink, devices)
@@ -330,7 +284,8 @@ class WasapiBackend:
             if pid in self._failed_apps:
                 continue
             engine = self._apps.get(pid)
-            if engine is None:
+            is_new = engine is None
+            if is_new:
                 try:
                     engine = Engine(pid=pid)
                     engine.start()
@@ -339,11 +294,7 @@ class WasapiBackend:
                     self._failed_apps.add(pid)
                     continue
                 self._apps[pid] = engine
-                try:
-                    engine.set_legs(ids)
-                except Exception:
-                    log.exception("Failed to set legs for app pid %d", pid)
-            elif set(engine.legs) != set(ids):
+            if is_new or set(engine.legs) != set(ids):
                 try:
                     engine.set_legs(ids)
                 except Exception:
@@ -386,8 +337,8 @@ class WasapiBackend:
 
     def find_orphans(self) -> list[VirtualSink]:
         """Nothing leaks on Windows — there are no kernel modules to unload.
-        The crash-recovery problem here is a stranded default endpoint
-        (Phase 6), not an orphaned sink."""
+        The crash-recovery problem here is a stranded default endpoint, not
+        an orphaned sink."""
         return []
 
     def get_volume(self, sink: str) -> int:
@@ -413,7 +364,7 @@ class WasapiBackend:
 
     def get_default(self) -> str | None:
         try:
-            return _policy.get_default()
+            return default_output_id()
         except Exception as e:
             log.warning("Failed to read default endpoint: %s", e)
             return None

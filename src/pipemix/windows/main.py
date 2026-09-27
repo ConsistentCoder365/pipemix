@@ -4,17 +4,8 @@ PipeMix — entry point (Windows).
 No arguments launches the GUI; --cli is the interactive text dashboard,
 and --list, --share and --refresh are one-shot commands.
 
-Forked from `pipemix.linux.main`. What changed and why:
-
-- No GLib: the CLI paths are straight-line calls, and the GUI path blocks in
-  `webview.start()`. `--share` keeps the process alive with a plain
-  `threading.Event` instead of `GLib.MainLoop`, and `--cli` reads stdin in a
-  blocking loop instead of watching a GLib-registered fd — the notification
-  worker thread that drives hotplug already runs on its own thread, so there
-  is no main loop to pump for it.
-- The log directory comes from `config_manager.default_log_dir()`, which is
-  already platform-aware and resolves to `%LOCALAPPDATA%\\PipeMix\\logs` here.
-- `WasapiBackend` instead of `PactlBackend`.
+Forked from `pipemix.linux.main`: no GLib main loop (blocking loops
+instead), and `WasapiBackend` instead of `PactlBackend`.
 """
 
 from __future__ import annotations
@@ -77,13 +68,7 @@ def print_status(ctrl: Controller) -> None:
 
 
 def run_console(ctrl: Controller) -> None:
-    """Dashboard plus a blocking read of stdin.
-
-    Unlike the Linux version there is no GLib main loop to share, so hotplug
-    events do not need a fd watch to be pumped — `wasapi.notify`'s worker
-    thread already calls back into the Controller on its own, whether or not
-    anyone is reading a key right now.
-    """
+    """Dashboard plus a blocking read of stdin."""
     ctrl.connect("state-changed", lambda state: log.info("Session state: %s", state.value.upper()))
     ctrl.connect("devices-changed", lambda devs: log.info("Device list refreshed (%d known)", len(devs)))
 

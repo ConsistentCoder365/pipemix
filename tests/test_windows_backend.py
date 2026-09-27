@@ -47,14 +47,12 @@ _ensure_stub(
     "pipemix.windows.wasapi.volume",
     get_volume=lambda sink: 100,
     set_volume=lambda sink, volume: None,
-    get_mute=lambda sink: False,
     set_mute=lambda sink, mute: None,
 )
 _ensure_stub(
     "pipemix.windows.wasapi.sessions",
     list_streams=lambda: [],
     set_stream_mute=lambda stream_id, mute: None,
-    set_stream_volume=lambda stream_id, volume: None,
 )
 
 from pipemix.models import AudioDevice, DeviceKind, VirtualSink
@@ -143,10 +141,8 @@ def _backend(monkeypatch, *, hub: bool = False, default: str | None = None) -> W
         monkeypatch.setattr(backend_mod, "list_outputs", lambda include_virtual=False: [])
         monkeypatch.setattr(backend_mod, "_capture_endpoints", lambda: [])
 
-    monkeypatch.setattr(backend_mod, "default_output_id", lambda: default)
-
     state = {"default": default}
-    monkeypatch.setattr(backend_mod._policy, "get_default", lambda: state["default"])
+    monkeypatch.setattr(backend_mod, "default_output_id", lambda: state["default"])
 
     def _set_default(sink):
         state["default"] = sink
@@ -228,10 +224,10 @@ def test_leader_mode_excludes_leader_from_legs(monkeypatch):
 
 
 def test_hub_mode_creates_no_engine_and_covers_every_device_in_legs(monkeypatch):
-    # Phase 1: hub create_sink no longer starts a CABLE Output engine at all —
-    # per-app routing replaces it (see set_app_routes below). sink.module is
-    # None, but sink.legs still lists every selected device, matching what
-    # the Apps tab / UI reads off the session regardless of engine mode.
+    # Hub create_sink starts no CABLE Output engine — per-app routing
+    # replaces it (see set_app_routes below). sink.module is None, but
+    # sink.legs still lists every selected device, matching what the Apps
+    # tab / UI reads off the session regardless of engine mode.
     b = _backend(monkeypatch, hub=True, default="original")
     devices = [_dev("dev_a"), _dev("dev_b")]
     sink = b.create_sink(devices)
@@ -242,23 +238,20 @@ def test_hub_mode_creates_no_engine_and_covers_every_device_in_legs(monkeypatch)
 
 
 def test_create_sink_leaves_the_default_alone(monkeypatch):
-    # Switching the Windows default is the Controller's job (`_route` does it
-    # via `sink.name`), exactly as on Linux. The backend doing it too meant it
-    # happened *before* `_level_hub` had set the level, so the first moment of
-    # audio could arrive at whatever volume that endpoint was sitting at.
+    # Switching the Windows default is the Controller's job, not create_sink's.
     b = _backend(monkeypatch, hub=True, default="original")
     sink = b.create_sink([_dev("dev_a")])
-    assert backend_mod._policy.get_default() == "original"
+    assert backend_mod.default_output_id() == "original"
     assert sink.name == "cable_in"   # but it names where the Controller should point
 
 
 # -- the sink's name has to be a real endpoint --
 
 # The Controller feeds `session.sink.name` straight back to `set_default`,
-# `set_volume` and `move_streams` (that is what `active_sink()` hands out), so
+# `set_volume` and `move_stream` (that is what `active_sink()` hands out), so
 # on Windows it must name an endpoint WASAPI knows. Naming it `pipemix_<uuid>`
-# the way Linux does makes every one of those calls fail with E_INVALIDARG at
-# the moment a session starts — which is exactly what it did.
+# the way Linux does would make every one of those calls fail with
+# E_INVALIDARG.
 
 def test_hub_mode_names_the_sink_after_cable_input(monkeypatch):
     b = _backend(monkeypatch, hub=True, default="original")
@@ -285,11 +278,11 @@ def test_destroy_sink_restores_previous_default(monkeypatch):
     sink = b.create_sink([_dev("dev_a"), _dev("dev_b")])
     # The Controller is what points Windows at the session, so stand in for it.
     b.set_default(sink.name)
-    assert backend_mod._policy.get_default() == "dev_a"  # elected leader
+    assert backend_mod.default_output_id() == "dev_a"  # elected leader
 
     b.destroy_sink(sink)
 
-    assert backend_mod._policy.get_default() == "original"
+    assert backend_mod.default_output_id() == "original"
     assert sink.module.stopped is True
     assert sink.legs == {}
     assert b.leader is None
@@ -348,13 +341,10 @@ def test_destroy_sink_unpins_apps_routed_to_the_hub_but_not_manual_moves(monkeyp
     b = _backend(monkeypatch, hub=True, default="original")
     fake_router = _FakeAppRouter()
     b._app_router = fake_router
-    monkeypatch.setattr(b, "list_streams", lambda: [
-        {"id": 1, "name": "AppA", "sink": "old", "mute": False},
-        {"id": 2, "name": "AppB", "sink": "old", "mute": False},
-    ])
     sink = b.create_sink([_dev("dev_a")])
 
-    b.move_streams(sink.name)
+    b.move_stream(1, sink.name)
+    b.move_stream(2, sink.name)
     assert b._routed == {1, 2}
 
     # The user manually points app 2 at a real device — leave that alone.
@@ -374,12 +364,8 @@ def test_destroy_sink_never_raises_when_clearing_a_route_fails(monkeypatch):
     fake_router = _FakeAppRouter()
     fake_router.fail_clear = {1}
     b._app_router = fake_router
-    monkeypatch.setattr(
-        b, "list_streams",
-        lambda: [{"id": 1, "name": "AppA", "sink": "old", "mute": False}],
-    )
     sink = b.create_sink([_dev("dev_a")])
-    b.move_streams(sink.name)
+    b.move_stream(1, sink.name)
     assert b._routed == {1}
 
     b.destroy_sink(sink)  # route(1, None) raises internally — must not propagate
@@ -400,7 +386,7 @@ def test_move_stream_with_none_clears_the_pin(monkeypatch):
     assert (1, None) in fake_router.calls
 
 
-# -- Phase 1 per-app routing: leader mode is unchanged --
+# -- per-app routing: leader mode is unchanged --
 
 def test_leader_mode_still_starts_exactly_one_engine(monkeypatch):
     b = _backend(monkeypatch, hub=False, default="dev_a")

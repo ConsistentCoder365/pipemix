@@ -12,14 +12,8 @@ That also collapses the duplicate events Windows emits for one physical
 reconnect (`OnDeviceAdded` and `OnDeviceStateChanged` both fire), since the
 worker only reports a change from the state it last knew.
 
-The registration itself happens **on that worker thread**, not on whoever
-calls `start()`, and that is not a detail. `comtypes.CoInitialize()` puts the
-calling thread in a single-threaded apartment, and COM marshals calls to an
-object registered from an STA back onto that one thread — where they are only
-delivered while it pumps a Windows message loop. `main.py --cli` blocks on
-`threading.Event().wait()` and never pumps, so every hotplug notification sat
-in a queue nobody drained and a disconnected headset went unnoticed. Owning
-the enumerator from an MTA thread removes the requirement entirely.
+Registration and unregistration happen on that same MTA worker thread, so
+notifications arrive without anyone needing to pump a message loop.
 """
 
 from __future__ import annotations

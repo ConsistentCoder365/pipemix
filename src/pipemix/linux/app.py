@@ -29,10 +29,7 @@ INSTALLED_WEB = Path("/usr/share/pipemix/web")
 def _entry() -> str:
     """The built frontend: local checkout first, then the installed copy.
 
-    From `src/pipemix/linux/app.py` the repo root is `parents[3]`. It was
-    `parents[2]` until this file moved down a level into `linux/`, which
-    quietly started pointing at `src/` instead — invisible in day-to-day work,
-    because the dev flow sets `PIPEMIX_DEV=1` and loads the vite server.
+    From `src/pipemix/linux/app.py` the repo root is `parents[3]`.
     """
     candidates = [
         Path(__file__).resolve().parents[3] / "frontend" / "dist",

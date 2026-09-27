@@ -21,11 +21,7 @@ import ctypes
 import logging
 from functools import lru_cache
 
-from pipemix.windows.wasapi.devices import default_output_id
-
 log = logging.getLogger(__name__)
-
-get_default = default_output_id  # re-exported: it's the eMultimedia default
 
 
 def set_default(device_id: str) -> None:
@@ -60,7 +56,6 @@ _IID_WIN10 = "{2a59116d-6c4f-45e0-a74f-707e3fef9258}"
 # _ChatContextChanged — so the slot we want is not in the same place on each.
 # Verified on Win11 26200: slot 25 returns S_OK and writes a real entry to
 # HKCU\...\Audio\PolicyConfig\PropertyStore.
-_RELEASE = 2
 _SET_PERSISTED_DEFAULT_ENDPOINT = {_IID_WIN11: 25, _IID_WIN10: 23}
 
 # Wrapping form the policy config factory demands — the raw endpoint id is
@@ -137,14 +132,6 @@ class AppRouter:
                 "AudioPolicyConfig factory unavailable on this Windows build — "
                 "per-app output routing disabled; volume and mute still work."
             )
-
-    def close(self) -> None:
-        if self._ptr is None:
-            return
-        release = _vtable_fn(self._ptr, _RELEASE, ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p))
-        release(self._ptr)
-        self._ptr = None
-        self.available = False
 
     def route(self, pid: int, device_id: str | None) -> None:
         """Persist `device_id` as pid's render default, or clear it if None.

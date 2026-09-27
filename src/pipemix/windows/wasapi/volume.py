@@ -2,10 +2,8 @@
 
 Mirrors `pactl set-sink-volume` / `set-sink-mute`: this moves the Windows
 volume slider for the endpoint itself, which is what a user expects when they
-move PipeMix's slider. Matches
-`src/pipemix/linux/services/backend/pactl_backend.py`'s error behaviour too —
-a failed read logs a warning and returns a safe default, a failed write
-raises `BackendError`.
+move PipeMix's slider. A failed read logs a warning and returns a safe
+default; a failed write raises `BackendError`.
 """
 
 from __future__ import annotations
@@ -44,15 +42,6 @@ def set_volume(device_id: str, volume: int) -> None:
         _endpoint_volume(device_id).SetMasterVolumeLevelScalar(vol / 100, IID_Empty)
     except Exception as e:
         raise BackendError(f"Failed to set volume of {device_id} to {vol}%: {e}") from e
-
-
-def get_mute(device_id: str) -> bool:
-    """False if it cannot be read — the safe default is "not muted"."""
-    try:
-        return bool(_endpoint_volume(device_id).GetMute())
-    except Exception as e:
-        log.warning("Failed to get mute state for %s: %s", device_id, e)
-        return False
 
 
 def set_mute(device_id: str, mute: bool) -> None:

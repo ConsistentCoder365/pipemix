@@ -153,7 +153,10 @@ class Engine:
                 self._open_source()
             except Exception as e:
                 self.error = e
-                log.error("Engine failed to open source %s: %s", self._source_name, e)
+                log.error(
+                    "Engine failed to open source %s: %s",
+                    self.source_id if self.pid is None else f"pid {self.pid}", e,
+                )
                 return
             finally:
                 self._ready.set()
@@ -170,10 +173,6 @@ class Engine:
             self._close()
             comtypes.CoUninitialize()
 
-    @property
-    def _source_name(self) -> str:
-        return self.source_id if self.pid is None else f"pid {self.pid}"
-
     def _device(self, device_id: str):
         from pycaw.utils import AudioUtilities
 
@@ -189,12 +188,7 @@ class Engine:
         from pycaw.api.mmdeviceapi import IMMEndpoint
         from pycaw.constants import EDataFlow
 
-        from pipemix.windows.wasapi.com import (
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            REFTIMES_PER_SEC,
-            IAudioCaptureClient,
-        )
+        from pipemix.windows.wasapi.com import AUDCLNT_STREAMFLAGS_LOOPBACK
 
         dev = self._device(self.source_id)
         # A render endpoint has to be mirrored; a capture endpoint already is
@@ -205,7 +199,22 @@ class Engine:
         self._client = dev.Activate(
             IAudioClient._iid_, comtypes.CLSCTX_ALL, None
         ).QueryInterface(IAudioClient)
-        self._fmt  = self._client.GetMixFormat()
+        self._fmt = self._client.GetMixFormat()
+        self._start_capture(flags)
+        log.info(
+            "Engine source open: %s (%s, %d Hz, %d ch)",
+            self.source_id, "loopback" if is_render else "capture",
+            self._rate, self._fmt.contents.nChannels,
+        )
+
+    def _start_capture(self, flags) -> None:
+        """Shared Initialize -> GetService -> Start tail for `self._client`/`self._fmt`."""
+        from pipemix.windows.wasapi.com import (
+            AUDCLNT_SHAREMODE_SHARED,
+            REFTIMES_PER_SEC,
+            IAudioCaptureClient,
+        )
+
         self._bpf  = self._fmt.contents.nBlockAlign
         self._rate = self._fmt.contents.nSamplesPerSec
         self._client.Initialize(
@@ -216,11 +225,6 @@ class Engine:
             IAudioCaptureClient._iid_
         ).QueryInterface(IAudioCaptureClient)
         self._client.Start()
-        log.info(
-            "Engine source open: %s (%s, %d Hz, %d ch)",
-            self.source_id, "loopback" if is_render else "capture",
-            self._rate, self._fmt.contents.nChannels,
-        )
 
     def _open_process_source(self) -> None:
         """Process loopback of `self.pid`, polled like any other source."""
@@ -228,15 +232,12 @@ class Engine:
         from pycaw.api.audioclient import IAudioClient
 
         from pipemix.windows.wasapi.com import (
-            AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            REFTIMES_PER_SEC,
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             IActivateAudioInterfaceAsyncOperation,
             IActivateAudioInterfaceCompletionHandler,
             IAgileObject,
-            IAudioCaptureClient,
             PROPVARIANT_BLOB,
             process_loopback_format,
             process_loopback_params,
@@ -278,18 +279,8 @@ class Engine:
         self._client = unk.QueryInterface(IAudioClient)
         # GetMixFormat is not supported on a process-loopback client, so we
         # pick the format; a pointer, like GetMixFormat's, so legs use it as is.
-        self._fmt  = ctypes.pointer(process_loopback_format())
-        self._bpf  = self._fmt.contents.nBlockAlign
-        self._rate = self._fmt.contents.nSamplesPerSec
-        self._client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-            BUFFER_MS * REFTIMES_PER_SEC // 1000, 0, self._fmt, None,
-        )
-        self._capture = self._client.GetService(
-            IAudioCaptureClient._iid_
-        ).QueryInterface(IAudioCaptureClient)
-        self._client.Start()
+        self._fmt = ctypes.pointer(process_loopback_format())
+        self._start_capture(AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM)
         log.info(
             "Engine source open: pid %d (process loopback, %d Hz, %d ch)",
             self.pid, self._rate, self._fmt.contents.nChannels,
