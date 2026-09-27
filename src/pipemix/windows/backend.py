@@ -57,6 +57,8 @@ class WasapiBackend:
         self._status: BackendStatus | None = None
         self._hub: str | None = None
         self._routed: set[int] = set()
+        self._apps: dict[int, Engine] = {}
+        self._failed_apps: set[int] = set()
 
     @property
     def leader(self) -> str | None:
@@ -226,12 +228,16 @@ class WasapiBackend:
         """
         Start the fan-out engine for this session and return its handle.
 
-        Hub mode captures VB-CABLE's "CABLE Output"; every selected device is
-        a leg. Leader mode elects one of the selected devices and
-        loopback-captures it; it is not a leg — it already plays through the
-        OS path, and looping it back to itself would feed it its own echo.
-        Either way the previous default is remembered so `destroy_sink` can
-        restore it.
+        Hub mode starts no engine at all: apps already play into CABLE Input,
+        silent on its own, and per-app routing (`set_app_routes`) captures
+        each app's own audio to send it where it belongs — see
+        PER-APP-ROUTING.md. `sink.legs` still lists every selected device so
+        callers that read it (the Apps tab, the UI) don't need to special
+        case the engine mode. Leader mode elects one of the selected devices
+        and loopback-captures it; it is not a leg — it already plays through
+        the OS path, and looping it back to itself would feed it its own
+        echo. Either way the previous default is remembered so `destroy_sink`
+        can restore it.
 
         Switching the Windows default to `sink.name` is the Controller's job,
         not done here, exactly as on Linux. Doing it here too meant it ran
@@ -253,18 +259,16 @@ class WasapiBackend:
                 )
             self._leader = None
             self._prev_default = self.restore_target(devices)
-            source_id = cable_out
             hub_id = cable_in
+            engine = None  # per-app engines are started later, by set_app_routes.
         else:
             self._leader = self._elect_leader(devices)
             self._prev_default = self.restore_target(devices)
-            source_id = self._leader
             hub_id = self._leader
+            engine = Engine(self._leader)
+            engine.start()
 
         self._hub = hub_id
-
-        engine = Engine(source_id)
-        engine.start()
 
         # `name` is the endpoint everything plays *into* — CABLE Input in hub
         # mode, the leader in leader mode. On Linux that slot holds the null
@@ -293,22 +297,76 @@ class WasapiBackend:
 
     def set_legs(self, sink: VirtualSink, devices: list[AudioDevice]) -> None:
         """Make the engine feed exactly these outputs. In leader mode the
-        leader is excluded, whether or not it is still in `devices`."""
+        leader is excluded, whether or not it is still in `devices`. In hub
+        mode `sink.module` is None (see `create_sink`) — only `sink.legs` is
+        updated; the actual fan-out is per-app, via `set_app_routes`."""
         wanted = [d for d in devices if d.id != self._leader]
-        engine: Engine = sink.module
-        engine.set_legs([d.id for d in wanted])
+        engine: Engine | None = sink.module
+        if engine is not None:
+            engine.set_legs([d.id for d in wanted])
         sink.legs = {d.id: 0 for d in wanted}
         log.info("%s now feeds %s", sink.name, sorted(sink.legs))
+
+    def set_app_routes(self, routes: dict[int, list[str]]) -> None:
+        """Reconcile per-app capture engines against `routes` (pid -> the
+        device ids that app should be heard on right now), called once per
+        Controller poll. One `Engine(pid=...)` runs per routed pid; a pid
+        that drops out of `routes` gets its engine stopped, and one whose
+        device ids changed gets `set_legs` — never a new engine. Never
+        raises: a pid that fails to start is logged and skipped, and is not
+        retried again until it leaves `routes` and comes back."""
+        wanted = set(routes)
+
+        for pid in list(self._apps):
+            if pid not in wanted:
+                engine = self._apps.pop(pid)
+                try:
+                    engine.stop()
+                except Exception:
+                    log.exception("Failed to stop app engine for pid %d", pid)
+        self._failed_apps &= wanted  # forget a failure once its pid leaves routes
+
+        for pid, ids in routes.items():
+            if pid in self._failed_apps:
+                continue
+            engine = self._apps.get(pid)
+            if engine is None:
+                try:
+                    engine = Engine(pid=pid)
+                    engine.start()
+                except Exception as e:
+                    log.warning("Could not start per-app capture for pid %d: %s", pid, e)
+                    self._failed_apps.add(pid)
+                    continue
+                self._apps[pid] = engine
+                try:
+                    engine.set_legs(ids)
+                except Exception:
+                    log.exception("Failed to set legs for app pid %d", pid)
+            elif set(engine.legs) != set(ids):
+                try:
+                    engine.set_legs(ids)
+                except Exception:
+                    log.exception("Failed to set legs for app pid %d", pid)
 
     def destroy_sink(self, sink: VirtualSink) -> None:
         """Safe to call when the sink is already gone — never raises."""
         log.info("Destroying session on %s", sink.name)
-        engine: Engine = sink.module
-        try:
-            engine.stop()
-        except Exception:
-            log.exception("Engine stop failed for %s", sink)
+        engine: Engine | None = sink.module
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                log.exception("Engine stop failed for %s", sink)
         sink.legs.clear()
+
+        for pid, app_engine in self._apps.items():
+            try:
+                app_engine.stop()
+            except Exception:
+                log.exception("Failed to stop app engine for pid %d", pid)
+        self._apps.clear()
+        self._failed_apps.clear()
 
         for pid in self._routed:
             try:
