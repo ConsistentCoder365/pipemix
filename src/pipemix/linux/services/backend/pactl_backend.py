@@ -19,8 +19,9 @@ from pipemix.linux.services.backend import BackendError, BackendHealth, BackendS
 
 log = logging.getLogger(__name__)
 
-# Delay the slowest leg gets; every other leg adds on top of it to line up with
-# it (see set_legs). High enough to survive a Bluetooth hiccup — tune by ear.
+# Buffer the slowest output keeps. Every leg gets this plus the slowest device's
+# latency; PipeWire subtracts each device's own latency from latency_msec, so
+# all outputs land together. High enough to survive a Bluetooth hiccup — tune by ear.
 LOOPBACK_LATENCY_MS = 60
 
 
@@ -335,10 +336,10 @@ class PactlBackend:
         # so a Bluetooth flap never glitches the outputs that stayed.
         sink.slowest = max([sink.slowest, *(lat.get(t, 0) for t in wanted)])
 
+        # One delay for every leg: latency_msec is end-to-end, and PipeWire already
+        # takes each device's own latency out of it.
+        ms = LOOPBACK_LATENCY_MS + sink.slowest // 1_000_000
         for target in wanted:
-            if not lat and target in sink.delays:
-                continue  # pw-dump failed transiently; don't disturb an already-aligned leg
-            ms = LOOPBACK_LATENCY_MS + (sink.slowest - lat.get(target, 0)) // 1_000_000
             if sink.delays.get(target) == ms:
                 continue
             module = _load([
