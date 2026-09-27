@@ -39,6 +39,10 @@ SINK_WAIT_MS = 250
 # session starting or a device plugging in fires several events back to back.
 PW_SETTLE_MS = 100
 
+# A device can report its real latency a moment after its leg loads (Bluetooth
+# settling on a codec), so a joining leg gets one re-read this long after.
+RECHECK_MS = 2000
+
 
 def locked(fn):
     """Serialize routing: the page calls in on one thread, background events on another."""
@@ -315,21 +319,33 @@ class Controller(GObject.Object):
             # of racing it — and it also sweeps out any app hub whose stream ended.
             self.emit("streams-changed", self.streams())
 
+    @locked
     def _hotplug(self) -> None:
-        """A wired output showed up or left; Bluetooth churn is BlueZ's job, not ours."""
+        """A wired output showed up or left, or a session Bluetooth sink was recreated."""
         try:
             wired = {d.id for d in self.backend.list_outputs() if d.kind != DeviceKind.BLUETOOTH}
         except Exception as e:
             log.error("Failed to check for hotplug: %s", e)
             return
         known = {i for i, d in self.devices.items() if d.kind != DeviceKind.BLUETOOTH and d.connected}
+        back = False
         if wired != known:
             self.refresh()
             # An unplugged output gets no BlueZ event, so it takes the same exit.
             for dev_id in known - wired:
                 self._on_disconnect(dev_id)
-            if (wired - known) & self.targets:
-                self._rebuild()
+            back = bool((wired - known) & self.targets)
+        # A codec switch or WirePlumber restart recreates a Bluetooth sink with
+        # no BlueZ event, and the old leg unloads itself along with the old sink.
+        bt = []
+        if self.session.sink or self.hubs:
+            used = self.targets | {i for ids in self.overrides.values() for i in ids}
+            bt = [d for d in self.devices.values() if d.kind == DeviceKind.BLUETOOTH and d.connected and d.id in used]
+        for d in bt:
+            d.sink = self.backend.resolve_bt_sink(d.id)
+        if back or bt:
+            self._rebuild()
+            self._sync_hubs()
 
     # ---------- Presets ----------
 
@@ -400,8 +416,9 @@ class Controller(GObject.Object):
 
         self.backend.set_default(sink.name)
         self.backend.move_streams(sink.name, exclude=list(self.overrides))
+        GLib.timeout_add(RECHECK_MS, self._bg, self._rebuild)
 
-    def _retarget(self, devices: list[AudioDevice]) -> None:
+    def _retarget(self, devices: list[AudioDevice], keep: set[str] = frozenset()) -> None:
         """Change which outputs the live hub feeds. The hub itself stays put."""
         sink = self.session.sink
         # Outputs already fed are already unmuted and at their own level.
@@ -414,10 +431,13 @@ class Controller(GObject.Object):
         duck = self._hub_level(devices) < self._hub_level(self.session.devices)
         if duck:
             self._level_hub(sink.name, devices)
-        self.backend.set_legs(sink, devices)
+        # Only on a leg that actually loaded (a failing load would re-arm forever),
+        # including one reloaded because its sink was recreated under the same name.
+        if self.backend.set_legs(sink, devices):
+            GLib.timeout_add(RECHECK_MS, self._bg, self._rebuild)
         if not duck:
             self._level_hub(sink.name, devices)
-        self._adopt(devices)
+        self._adopt(devices, keep)
 
     def _prepare(self, devices: list[AudioDevice]) -> None:
         """Unmute each output and put it back at its own level."""
@@ -430,10 +450,10 @@ class Controller(GObject.Object):
                 except Exception as e:
                     log.warning("Failed to configure %s: %s", d.name, e)
 
-    def _adopt(self, devices: list[AudioDevice]) -> None:
+    def _adopt(self, devices: list[AudioDevice], keep: set[str] = frozenset()) -> None:
         """Record who the session is for, now that the routing matches."""
         self.session.devices = devices
-        self.targets = {d.id for d in devices}
+        self.targets = {d.id for d in devices} | keep
         # The page reads who is in the session off each device.
         self.emit("devices-changed", list(self.devices.values()))
         self._set_state(SessionState.ACTIVE)
@@ -626,7 +646,8 @@ class Controller(GObject.Object):
             return
 
         log.info("Reconnected — feeding %s again.", [d.name for d in ready])
-        self._retarget(ready)
+        # Still-offline targets stay targets, or they never get their leg back.
+        self._retarget(ready, self.targets)
 
     def _set_state(self, state: SessionState) -> None:
         if self.session.state != state:

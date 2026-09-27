@@ -80,16 +80,18 @@ class Api:
         return out
 
     def _apply_selection(self) -> None:
-        """Share to whatever is ticked, or stop if nothing is."""
-        devices = [
-            self._controller.devices[i]
-            for i, on in self._selected.items()
-            if on and i in self._controller.devices
-        ]
-        if devices:
-            self._controller.start_sharing(devices)
-        else:
-            self._controller.stop_sharing()
+        """Share to whatever is ticked, or stop if nothing is. Locked so two quick
+        toggles apply in order and the last one wins (RLock, re-entrant with @locked)."""
+        with self._controller._lock:
+            devices = [
+                self._controller.devices[i]
+                for i, on in self._selected.items()
+                if on and i in self._controller.devices
+            ]
+            if devices:
+                self._controller.start_sharing(devices)
+            else:
+                self._controller.stop_sharing()
 
     def _clear_preset(self) -> None:
         """A hand-toggled device no longer matches the preset."""
@@ -115,11 +117,12 @@ class Api:
 
     @call
     def toggle_device(self, dev_id: str, active: bool) -> list[dict]:
-        self._selected[dev_id] = active
-        self._clear_preset()
-        # A live session follows the ticks immediately.
-        if self._controller.session.is_active:
-            self._apply_selection()
+        with self._controller._lock:
+            self._selected[dev_id] = active
+            self._clear_preset()
+            # A live session follows the ticks immediately.
+            if self._controller.session.is_active:
+                self._apply_selection()
         return self._devices_payload()
 
     @call
@@ -185,14 +188,15 @@ class Api:
         log.info("Loading preset '%s': %s", preset.get("name"), wanted)
         self._controller.last_preset = preset_id
 
-        for dev_id in self._selected:
-            self._selected[dev_id] = dev_id in wanted
-        # A preset can name a device this session has not seen yet.
-        for dev_id in wanted:
-            self._selected.setdefault(dev_id, True)
+        with self._controller._lock:
+            for dev_id in self._selected:
+                self._selected[dev_id] = dev_id in wanted
+            # A preset can name a device this session has not seen yet.
+            for dev_id in wanted:
+                self._selected.setdefault(dev_id, True)
 
-        if self._controller.session.is_active:
-            self._apply_selection()
+            if self._controller.session.is_active:
+                self._apply_selection()
         return {"devices": self._devices_payload(), "preset": preset_id}
 
     @call
