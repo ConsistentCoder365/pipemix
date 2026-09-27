@@ -48,6 +48,7 @@ def _backend(engine: str = "hub") -> MagicMock:
     b.find_orphans.return_value = []
     b.list_outputs.return_value = []
     b.get_default.return_value = "prev_default"
+    b.restore_target.return_value = "prev_default"
     b.get_volume.return_value = 50
     b.leader = None
     b.create_sink.side_effect = _fake_create
@@ -64,6 +65,7 @@ def _leader_backend() -> MagicMock:
     b.find_orphans.return_value = []
     b.list_outputs.return_value = []
     b.get_default.return_value = "prev_default"
+    b.restore_target.return_value = "prev_default"
     b.get_volume.return_value = 50
     b.leader = None
 
@@ -228,6 +230,51 @@ def test_on_connect_of_a_non_target_does_not_rebuild(tmp_path: Path) -> None:
 
     assert "EP-new" in ctrl.devices
     b.set_legs.assert_not_called()
+
+
+# -- Volume: unmute param must be accepted, and applied on the non-solo master path --
+
+def test_set_device_volume_accepts_unmute_param(tmp_path: Path) -> None:
+    b = _backend()
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1 = _dev("EP1")
+    ctrl.devices = {d1.id: d1}
+
+    ctrl.set_device_volume(d1.id, 75, unmute=True)
+
+    b.set_mute.assert_called_once_with(d1.sink, False)
+    b.set_volume.assert_called_once_with(d1.sink, 75)
+    assert ctrl.devices[d1.id].volume == 75
+
+
+def test_set_master_volume_unmutes_hub_when_asked(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    b.set_mute.reset_mock()
+    b.set_volume.reset_mock()
+
+    ctrl.set_master_volume(60, unmute=True)
+
+    b.set_mute.assert_called_once_with(ctrl.active_sink(), False)
+    b.set_volume.assert_called_once_with(ctrl.active_sink(), 60)
+
+
+def test_set_master_volume_without_unmute_does_not_touch_mute(tmp_path: Path) -> None:
+    b = _backend(engine="hub")
+    ctrl = _ctrl(tmp_path, backend=b)
+    d1, d2 = _dev("EP1"), _dev("EP2")
+    ctrl.devices = {d.id: d for d in (d1, d2)}
+    ctrl.start_sharing([d1, d2])
+    b.set_mute.reset_mock()
+    b.set_volume.reset_mock()
+
+    ctrl.set_master_volume(60)
+
+    b.set_mute.assert_not_called()
+    b.set_volume.assert_called_once_with(ctrl.active_sink(), 60)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ def _backend(engine: str = "hub") -> MagicMock:
     b.find_orphans.return_value = []
     b.list_outputs.return_value = []
     b.get_default.return_value = "prev_default"
+    b.restore_target.return_value = "prev_default"
     b.get_volume.return_value = 50
     b.leader = None
     b.create_sink.side_effect = _fake_create
@@ -146,3 +147,46 @@ def test_start_sharing_persists_prev_default_before_changing_it(tmp_path: Path) 
     save_index = calls.index("save:'prev_default'")
     set_default_index = next(i for i, c in enumerate(calls) if c.startswith("set_default:"))
     assert save_index < set_default_index
+
+
+# -- restore_target replaces get_default when recording what to restore --
+
+def test_start_sharing_records_restore_target_not_get_default(tmp_path: Path) -> None:
+    b = _backend()
+    d1 = _dev("EP1")
+    b.list_outputs.return_value = [d1]
+    b.get_default.return_value = "CABLE Input"          # the hub is already default
+    b.restore_target.return_value = "real_device"        # what should actually come back
+    ctrl = _ctrl(tmp_path, backend=b)
+
+    ctrl.start_sharing([d1])
+
+    b.restore_target.assert_called_once_with([d1])
+    assert ctrl.prev_default == "real_device"
+    assert ctrl.config.data["prev_default"] == "real_device"
+
+
+# -- Startup self-heal: no session, but the default is still our own hub --
+
+def test_startup_heals_a_stranded_hub_default_with_no_session(tmp_path: Path) -> None:
+    b = _backend()
+    b.list_outputs.return_value = [_dev("EP1")]
+    b.get_default.return_value = "CABLE Input"
+    b.restore_target.return_value = "EP1"
+    ctrl = _ctrl(tmp_path, backend=b)
+
+    ctrl.clean_orphans()
+
+    b.set_default.assert_called_once_with("EP1")
+
+
+def test_startup_heal_is_a_noop_when_default_already_matches(tmp_path: Path) -> None:
+    b = _backend()
+    b.list_outputs.return_value = [_dev("EP1")]
+    b.get_default.return_value = "EP1"
+    b.restore_target.return_value = "EP1"
+    ctrl = _ctrl(tmp_path, backend=b)
+
+    ctrl.clean_orphans()
+
+    b.set_default.assert_not_called()
