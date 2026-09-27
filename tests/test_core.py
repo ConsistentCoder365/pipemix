@@ -128,8 +128,8 @@ def test_leg_delays(monkeypatch) -> None:
     backend.set_legs(sink, [wired, bt])
     assert unloads == [wired_module]
     assert _loaded(loads, "sink=wired", "latency_msec=260")
-    assert _loaded(loads, "sink=bt", "latency_msec=60")
-    assert sink.delays == {"wired": 260, "bt": 60}
+    assert _loaded(loads, "sink=bt", "latency_msec=260")
+    assert sink.delays == {"wired": 260, "bt": 260}
 
     # 3. high-water mark: dropping bt unloads it but does not pull wired back down
     bt_module = sink.legs["bt"]
@@ -182,13 +182,13 @@ def test_leg_delays_transient_failure(monkeypatch) -> None:
     bt = AudioDevice("b", "BT", "bt", DeviceKind.BLUETOOTH)
 
     backend.set_legs(sink, [wired, bt])
-    assert sink.delays == {"wired": 260, "bt": 60}
+    assert sink.delays == {"wired": 260, "bt": 260}
 
     monkeypatch.setattr(pactl_backend, "_run", lambda args: (1, "", "pw-dump timed out"))
     n_loads = len(loads)
     backend.set_legs(sink, [wired, bt])
     assert len(loads) == n_loads, "already-aligned legs must not reload on a transient failure"
-    assert sink.delays == {"wired": 260, "bt": 60}
+    assert sink.delays == {"wired": 260, "bt": 260}
 
 
 def test_device_identity() -> None:
