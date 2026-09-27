@@ -55,6 +55,8 @@ class WasapiBackend:
         self._prev_default: str | None = None
         self._leader: str | None = None
         self._status: BackendStatus | None = None
+        self._hub: str | None = None
+        self._routed: set[int] = set()
 
     @property
     def leader(self) -> str | None:
@@ -106,6 +108,37 @@ class WasapiBackend:
 
         return cable_in, cable_out
 
+    def restore_target(self, devices: list[AudioDevice] = ()) -> str | None:
+        """The endpoint to put back as default when a session ends: the
+        current Windows default, unless that is CABLE Input (our own hub) —
+        then the first connected device in `devices` that isn't the cable,
+        else the first connected output from `list_outputs()` (which already
+        hides virtual endpoints), else None. Never raises.
+
+        Only CABLE Input is rejected here, not every virtual endpoint — a
+        user who deliberately defaults to e.g. Voicemeeter must still get it
+        back.
+        """
+        cable_in, _ = self._find_cable()
+        current = self.get_default()
+        if current and current != cable_in:
+            return current
+
+        for d in devices:
+            if d.connected and d.id != cable_in:
+                return d.id
+
+        try:
+            outputs = self.list_outputs()
+        except BackendError as e:
+            log.debug("Could not enumerate outputs for restore target: %s", e)
+            outputs = []
+        for d in outputs:
+            if d.connected:
+                return d.id
+
+        return None
+
     def list_outputs(self) -> list[AudioDevice]:
         try:
             devices = list_outputs()
@@ -149,7 +182,7 @@ class WasapiBackend:
             if s["id"] in skip:
                 continue
             try:
-                self._app_router.route(s["id"], target)
+                self._route_stream(s["id"], target)
                 moved += 1
             except Exception as e:
                 log.warning("Failed to move stream %d: %s", s["id"], e)
@@ -167,9 +200,20 @@ class WasapiBackend:
             raise BackendError("Per-app routing is not available on this system.")
         log.info("Moving stream %d → %s", stream_id, target)
         try:
-            self._app_router.route(stream_id, target)
+            self._route_stream(stream_id, target)
         except Exception as e:
             raise BackendError(f"Failed to move stream {stream_id} to {target}: {e}") from e
+
+    def _route_stream(self, pid: int, target: str) -> None:
+        """Persist `pid`'s route and track whether it now points at our hub,
+        so `destroy_sink` knows which apps to unpin when the session ends. A
+        manual route to some other real device is the user's choice — leave
+        it alone."""
+        self._app_router.route(pid, target)
+        if target == self._hub:
+            self._routed.add(pid)
+        else:
+            self._routed.discard(pid)
 
     def set_stream_mute(self, stream_id: int, mute: bool) -> None:
         try:
@@ -207,14 +251,16 @@ class WasapiBackend:
                     "VB-CABLE endpoints disappeared before the session could start."
                 )
             self._leader = None
-            self._prev_default = self.get_default()
+            self._prev_default = self.restore_target(devices)
             source_id = cable_out
             hub_id = cable_in
         else:
             self._leader = self._elect_leader(devices)
-            self._prev_default = self.get_default()
+            self._prev_default = self.restore_target(devices)
             source_id = self._leader
             hub_id = self._leader
+
+        self._hub = hub_id
 
         engine = Engine(source_id)
         engine.start()
@@ -262,6 +308,14 @@ class WasapiBackend:
         except Exception:
             log.exception("Engine stop failed for %s", sink)
         sink.legs.clear()
+
+        for pid in self._routed:
+            try:
+                self._app_router.route(pid, None)
+            except Exception as e:
+                log.warning("Failed to unpin stream %d from the hub: %s", pid, e)
+        self._routed.clear()
+        self._hub = None
 
         if self._prev_default:
             try:

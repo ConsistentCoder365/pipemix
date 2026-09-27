@@ -92,6 +92,22 @@ class _FakeEngine:
         return sorted(self._legs)
 
 
+class _FakeAppRouter:
+    """Stands in for wasapi.policy.AppRouter: records every route call so
+    tests can assert which pids got pinned to the hub and unpinned again."""
+
+    available = True
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str | None]] = []
+        self.fail_clear: set[int] = set()
+
+    def route(self, pid: int, device_id: str | None) -> None:
+        if device_id is None and pid in self.fail_clear:
+            raise RuntimeError("process already exited")
+        self.calls.append((pid, device_id))
+
+
 def _backend(monkeypatch, *, hub: bool = False, default: str | None = None) -> WasapiBackend:
     """A backend with the engine and every wasapi.* call faked."""
     _FakeEngine.instances = []
@@ -273,3 +289,85 @@ def test_destroy_sink_never_raises_when_engine_stop_fails(monkeypatch):
     sink.module.stop = _boom
 
     b.destroy_sink(sink)  # must not raise
+
+
+# -- restore_target --
+
+def test_restore_target_returns_current_default_when_real_device(monkeypatch):
+    b = _backend(monkeypatch, hub=False, default="dev_a")
+    assert b.restore_target([_dev("dev_a")]) == "dev_a"
+
+
+def test_restore_target_falls_back_to_selected_device_when_default_is_cable(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="cable_in")
+    result = b.restore_target([_dev("dev_a"), _dev("dev_b")])
+    assert result == "dev_a"
+
+
+def test_restore_target_falls_back_to_list_outputs_when_no_selected_device_qualifies(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="cable_in")
+    monkeypatch.setattr(
+        backend_mod, "list_outputs",
+        lambda include_virtual=False: (
+            [_dev("cable_in", "CABLE Input (VB-Audio Virtual Cable)")]
+            if include_virtual else [_dev("real_dev")]
+        ),
+    )
+    # dev "cable_in" itself and a disconnected device don't qualify.
+    result = b.restore_target([_dev("cable_in"), _dev("dev_b", connected=False)])
+    assert result == "real_dev"
+
+
+# -- create_sink must never strand CABLE Input as the restore target --
+
+def test_create_sink_never_records_cable_input_as_prev_default(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="cable_in")
+    b.create_sink([_dev("dev_a")])
+    assert b._prev_default != "cable_in"
+    assert b._prev_default == "dev_a"
+
+
+# -- per-app routes to the hub are undone; manual routes elsewhere are not --
+
+def test_destroy_sink_unpins_apps_routed_to_the_hub_but_not_manual_moves(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    fake_router = _FakeAppRouter()
+    b._app_router = fake_router
+    monkeypatch.setattr(b, "list_streams", lambda: [
+        {"id": 1, "name": "AppA", "sink": "old", "mute": False},
+        {"id": 2, "name": "AppB", "sink": "old", "mute": False},
+    ])
+    sink = b.create_sink([_dev("dev_a")])
+
+    b.move_streams(sink.name)
+    assert b._routed == {1, 2}
+
+    # The user manually points app 2 at a real device — leave that alone.
+    b.move_stream(2, "dev_a")
+    assert b._routed == {1}
+
+    b.destroy_sink(sink)
+
+    assert (1, None) in fake_router.calls
+    assert not any(pid == 2 and target is None for pid, target in fake_router.calls)
+    assert b._routed == set()
+    assert b._hub is None
+
+
+def test_destroy_sink_never_raises_when_clearing_a_route_fails(monkeypatch):
+    b = _backend(monkeypatch, hub=True, default="original")
+    fake_router = _FakeAppRouter()
+    fake_router.fail_clear = {1}
+    b._app_router = fake_router
+    monkeypatch.setattr(
+        b, "list_streams",
+        lambda: [{"id": 1, "name": "AppA", "sink": "old", "mute": False}],
+    )
+    sink = b.create_sink([_dev("dev_a")])
+    b.move_streams(sink.name)
+    assert b._routed == {1}
+
+    b.destroy_sink(sink)  # route(1, None) raises internally — must not propagate
+
+    assert b._routed == set()
+    assert b._hub is None

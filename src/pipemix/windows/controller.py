@@ -115,6 +115,11 @@ class Controller(SignalEmitter):
         `prev_default` to config before it changes the default, and
         `stop_sharing` clears it after a clean restore — so a `prev_default`
         still on disk here means the last run never got that far.
+
+        Beyond that specific crash trail, also self-heal whatever state the
+        user was actually left in: if nothing is running and Windows' default
+        is still our own hub (CABLE Input), there is no session left to blame
+        it on — put back whatever `restore_target` would have restored to.
         """
         try:
             for sink in self.backend.find_orphans():
@@ -122,21 +127,34 @@ class Controller(SignalEmitter):
                 self.backend.destroy_sink(sink)
 
             stranded = self.config.data.get("prev_default")
-            if not stranded:
+            restored_stranded = False
+            if stranded:
+                live_ids = {d.id for d in self.backend.list_outputs()}
+                if stranded not in live_ids:
+                    log.warning(
+                        "Previous run was interrupted, but its default output "
+                        "(%s) is no longer connected — leaving it as is.", stranded)
+                else:
+                    log.warning(
+                        "Previous run was interrupted — restoring default output to %s.", stranded)
+                    self.backend.set_default(stranded)
+                    restored_stranded = True
+
+                self.config.data["prev_default"] = None
+                self.config.save()
+
+            # The stranded-default path above already restored something (or
+            # deliberately left a vanished endpoint alone) — never double-set.
+            if restored_stranded or self.session.is_active:
                 return
 
-            live_ids = {d.id for d in self.backend.list_outputs()}
-            if stranded not in live_ids:
+            current = self.backend.get_default()
+            target = self.backend.restore_target([])
+            if target and target != current:
                 log.warning(
-                    "Previous run was interrupted, but its default output "
-                    "(%s) is no longer connected — leaving it as is.", stranded)
-            else:
-                log.warning(
-                    "Previous run was interrupted — restoring default output to %s.", stranded)
-                self.backend.set_default(stranded)
-
-            self.config.data["prev_default"] = None
-            self.config.save()
+                    "Windows default is PipeMix's hub (CABLE Input) with no "
+                    "session running — restoring output to %s", target)
+                self.backend.set_default(target)
         except Exception as e:
             log.error("Error during crash recovery: %s", e)
 
@@ -169,7 +187,7 @@ class Controller(SignalEmitter):
         except Exception:
             return 50
 
-    def set_device_volume(self, dev_id: str, volume: int) -> None:
+    def set_device_volume(self, dev_id: str, volume: int, unmute: bool = False) -> None:
         dev = self.devices.get(dev_id)
         if not dev:
             return
@@ -183,7 +201,7 @@ class Controller(SignalEmitter):
             except Exception as e:
                 log.error("Failed to set volume for %s: %s", dev_id, e)
 
-    def set_master_volume(self, volume: int) -> None:
+    def set_master_volume(self, volume: int, unmute: bool = False) -> None:
         self.master_volume = volume
 
         solo = self._solo()
@@ -191,13 +209,15 @@ class Controller(SignalEmitter):
             # The session is transparent for a lone output, so the level
             # belongs on the device — and its row has to move with the master
             # row.
-            self.set_device_volume(solo.id, volume)
+            self.set_device_volume(solo.id, volume, unmute)
             self.emit("devices-changed", list(self.devices.values()))
             return
 
         target = self.active_sink() if self.session.is_active else self.prev_default
         if target:
             try:
+                if unmute:
+                    self.backend.set_mute(target, False)
                 self.backend.set_volume(target, volume)
             except Exception as e:
                 log.error("Failed to set master volume on %s: %s", target, e)
@@ -276,7 +296,7 @@ class Controller(SignalEmitter):
         log.info("Starting session with %d device(s)...", len(devices))
         self._set_state(SessionState.STARTING)
         try:
-            self.prev_default = self.backend.get_default()
+            self.prev_default = self.backend.restore_target(devices)
             self.config.data["prev_default"] = self.prev_default
             self.config.save()
             self.session.sink = self._route(devices)
