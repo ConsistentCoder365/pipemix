@@ -48,7 +48,17 @@ export default function Apps(props: AppsProps) {
       await call<null>("route_stream", id, devices);
     } catch (e) {
       onError(msg(e));
+      return;
     }
+    // Some apps only pick an output when they open their audio, so the route
+    // can be accepted here and still not take effect. Windows has no live
+    // stream notifications, so a delayed re-check is the only way the row
+    // learns that.
+    setTimeout(() => {
+      call<Stream[]>("list_streams")
+        .then((fresh) => onStreams(() => fresh))
+        .catch((e: unknown) => onError(msg(e)));
+    }, 1500);
   };
 
   const mute = async (s: Stream) => {
@@ -99,8 +109,10 @@ export default function Apps(props: AppsProps) {
                   </div>
                   <div className="grow">
                     <div className="lvnm">{s.name}</div>
-                    <div className="sid">
-                      stream {s.id} · {pin ? "pinned by you" : "following the session"}
+                    <div className={s.stuck ? "sid warn" : "sid"}>
+                      {s.stuck
+                        ? `didn't switch — restart ${s.name} to apply`
+                        : `stream ${s.id} · ${pin ? "pinned by you" : "following the session"}`}
                     </div>
                   </div>
                   <button

@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from pipemix.linux.models import AudioDevice, DeviceKind, VirtualSink
+from pipemix.models import AudioDevice, DeviceKind, VirtualSink
 from pipemix.linux.services.backend import pactl_backend
 from pipemix.linux.services.backend.pactl_backend import PactlBackend, _kind
 
