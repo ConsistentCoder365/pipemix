@@ -190,3 +190,21 @@ def test_startup_heal_is_a_noop_when_default_already_matches(tmp_path: Path) -> 
     ctrl.clean_orphans()
 
     b.set_default.assert_not_called()
+
+
+# -- Startup self-heal also un-pins apps a previous run left pinned --
+
+def test_clean_orphans_unpins_a_running_app_left_pinned(tmp_path: Path) -> None:
+    b = _backend()
+    b.list_outputs.return_value = [_dev("EP1")]
+    b.list_streams.return_value = [
+        {"id": 42, "name": "App", "sink": "EP1", "mute": False, "exe": "C:\\App.exe"},
+    ]
+    cfg = ConfigManager(tmp_path / "config.json")
+    cfg.data["pinned_apps"] = ["C:\\App.exe"]
+    ctrl = _ctrl(tmp_path, backend=b, config=cfg)
+
+    ctrl.clean_orphans()
+
+    b.move_stream.assert_called_once_with(42, None)
+    assert cfg.data["pinned_apps"] == []

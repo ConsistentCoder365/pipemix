@@ -189,22 +189,23 @@ class WasapiBackend:
 
         log.info("Moved %d/%d stream(s) to %s", moved, len(streams), target)
 
-    def move_stream(self, stream_id: int, target: str) -> None:
+    def move_stream(self, stream_id: int, target: str | None) -> None:
         """
-        Route one app to `target`.
+        Route one app to `target`, or clear its pin with None so the app
+        goes back to following the machine default.
 
         Unlike `pactl move-sink-input`, this sets a *persisted preference* —
         the app may not pick it up until it next opens an audio stream.
         """
         if not self._app_router.available:
             raise BackendError("Per-app routing is not available on this system.")
-        log.info("Moving stream %d → %s", stream_id, target)
+        log.info("Moving stream %d → %s", stream_id, target or "(cleared)")
         try:
             self._route_stream(stream_id, target)
         except Exception as e:
             raise BackendError(f"Failed to move stream {stream_id} to {target}: {e}") from e
 
-    def _route_stream(self, pid: int, target: str) -> None:
+    def _route_stream(self, pid: int, target: str | None) -> None:
         """Persist `pid`'s route and track whether it now points at our hub,
         so `destroy_sink` knows which apps to unpin when the session ends. A
         manual route to some other real device is the user's choice — leave

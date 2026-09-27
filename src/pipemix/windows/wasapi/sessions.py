@@ -10,8 +10,12 @@ with, unlike the Linux backend this mirrors
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+from functools import lru_cache
+from pathlib import Path, PureWindowsPath
+from xml.etree import ElementTree
 
 from pipemix.linux.services.backend import BackendError
 
@@ -28,6 +32,54 @@ def _stream_name(display_name: str | None, process_name: str | None, pid: int) -
     if process_name:
         return process_name
     return f"pid {pid}"
+
+
+@lru_cache(maxsize=64)
+def _package_name(exe: str) -> str | None:
+    """The Store package's display name for an exe inside one, else None.
+
+    Packaged apps often play through a helper (Apple Music's audio comes from
+    AMPLibraryAgent.exe, launched by COM, not by AppleMusic.exe), so the
+    process name means nothing to the user but the package name does. The
+    folder under WindowsApps *is* the package full name; the manifest's
+    DisplayName is usually an ms-resource that only SHLoadIndirectString
+    resolves.
+    """
+    try:
+        path = PureWindowsPath(exe)
+        i = [p.lower() for p in path.parts].index("windowsapps")
+        full = path.parts[i + 1]
+        root = ElementTree.parse(Path(*path.parts[:i + 2], "AppxManifest.xml")).getroot()
+        props = next(e for e in root if e.tag.endswith("}Properties"))
+        name = next(e.text for e in props if e.tag.endswith("}DisplayName"))
+        if not name.startswith("ms-resource:"):
+            return name
+        key = name[len("ms-resource:"):]
+        pkg = full.split("_")[0]
+        uri = f"ms-resource://{pkg}/{key}" if "/" in key else f"ms-resource://{pkg}/resources/{key}"
+        buf = ctypes.create_unicode_buffer(512)
+        if ctypes.windll.shlwapi.SHLoadIndirectString(f"@{{{full}?{uri}}}", buf, 512, None) == 0:
+            return buf.value or None
+    except Exception as e:
+        log.debug("No package name for %s: %s", exe, e)
+    return None
+
+
+def _process_exe(process) -> str | None:
+    if process is None:
+        return None
+    try:
+        return process.exe()
+    except Exception:
+        return None
+
+
+def _process_label(process, exe: str | None) -> str | None:
+    if process is None:
+        return None
+    if exe is None:
+        return process.name()
+    return _package_name(exe) or process.name()
 
 
 def _dedupe_sessions(records: list[dict], own_pid: int) -> list[dict]:
@@ -77,25 +129,38 @@ def _session_records() -> list[dict]:
                 "pid": session.ProcessId,
                 "session": session,
                 "sink": device.FriendlyName,
+                "endpoint": device.id,
+                "active": ctl.GetState() == 1,  # AudioSessionStateActive
             })
+    # An app keeps idle sessions on endpoints it played to before; the one
+    # actually playing has to win the dedupe, or its label and mute go to a
+    # stale session on the wrong device.
+    records.sort(key=lambda r: not r["active"])
     return records
 
 
 def list_streams() -> list[dict]:
-    """Application streams now playing: {"id", "name", "sink", "mute"}."""
+    """Application streams now playing: {"id", "name", "sink", "endpoint", "active", "mute", "exe"}."""
     records = _dedupe_sessions(_session_records(), os.getpid())
     streams = []
     for r in records:
         session = r["session"]
         process = session.Process
-        name = _stream_name(session.DisplayName, process.name() if process else None, r["pid"])
+        exe = _process_exe(process)
+        name = _stream_name(session.DisplayName, _process_label(process, exe), r["pid"])
         streams.append({
-            "id":   r["pid"],
-            "name": name,
-            "sink": r["sink"],
-            "mute": bool(session.SimpleAudioVolume.GetMute()),
+            "id":       r["pid"],
+            "name":     name,
+            "sink":     r["sink"],
+            "endpoint": r["endpoint"],
+            "active":   r["active"],
+            "mute":     bool(session.SimpleAudioVolume.GetMute()),
+            "exe":      exe,
         })
-    return streams
+    # A packaged app's window and its audio helper get the same package name;
+    # an idle twin of a playing app is noise, and routing it does nothing.
+    playing = {s["name"] for s in streams if s["active"]}
+    return [s for s in streams if s["active"] or s["name"] not in playing]
 
 
 def _find_session(pid: int):

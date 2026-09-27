@@ -72,6 +72,10 @@ class Controller(SignalEmitter):
         # Streams the user routed by hand, so a rebuild does not drag them back.
         self.overrides: dict[int, str] = {}
 
+        # Last known exe per stream pid, so a pin can be recorded/cleared in
+        # config.data["pinned_apps"] by exe even after the pid exits.
+        self._exe: dict[int, str] = {}
+
         self.master_volume = 50
 
         # The page calls in on pywebview's thread while the notification
@@ -102,6 +106,13 @@ class Controller(SignalEmitter):
                 self.stop_sharing()
             except Exception as e:
                 log.error("Failed to stop sharing during shutdown: %s", e)
+        else:
+            # Pins made while idle are still ours to undo on the way out.
+            self.overrides.clear()
+            try:
+                self._sweep_pins(self.backend.list_streams())
+            except Exception as e:
+                log.warning("Failed to sweep leftover per-app pins: %s", e)
         self.monitor.stop()
 
     def clean_orphans(self) -> None:
@@ -125,6 +136,13 @@ class Controller(SignalEmitter):
             for sink in self.backend.find_orphans():
                 log.warning("Destroying orphaned sink: %s", sink.name)
                 self.backend.destroy_sink(sink)
+
+            # Overrides are empty this early, so any app still pinned by a
+            # previous run gets cleared here rather than waiting for streams().
+            try:
+                self._sweep_pins(self.backend.list_streams())
+            except Exception as e:
+                log.warning("Failed to sweep leftover per-app pins: %s", e)
 
             stranded = self.config.data.get("prev_default")
             restored_stranded = False
@@ -321,7 +339,11 @@ class Controller(SignalEmitter):
         self._level_hub(sink.name, devices)
 
         self.backend.set_default(sink.name)
-        self.backend.move_streams(sink.name, exclude=list(self.overrides))
+        # Apps already follow the machine default we just changed, into the
+        # hub — no need to pin every one of them there too. Per-app routes
+        # are a *persisted* preference keyed by exe, not a live move: pinning
+        # everything here would survive this session and strand those apps
+        # on the hub the next time PipeMix isn't running.
         return sink
 
     def _retarget(self, devices: list[AudioDevice]) -> None:
@@ -361,28 +383,80 @@ class Controller(SignalEmitter):
         """What is playing, each with the device it was pinned to (None: following)."""
         live = self.backend.list_streams()
         ids = {s["id"] for s in live}
+        for s in live:
+            if s.get("exe"):
+                self._exe[s["id"]] = s["exe"]
         for sid in [s for s in self.overrides if s not in ids]:
             del self.overrides[sid]
-        return [
-            {**s, "devices": [self.overrides[s["id"]]] if s["id"] in self.overrides else None}
-            for s in live
-        ]
+        self._sweep_pins(live)
+        out = []
+        for s in live:
+            if s["id"] in self.overrides:
+                target = self.devices.get(self.overrides[s["id"]])
+                expected = target.sink if target else None
+            elif self.session.is_active:
+                expected = self.active_sink()
+            else:
+                expected = None
+            # Some apps only pick an output when they open their audio, so a
+            # route can be accepted (pin set, default changed) and still not
+            # take effect until the app reopens its stream.
+            stuck = bool(s.get("active") and expected and s.get("endpoint") != expected)
+            out.append({
+                **s,
+                "devices": [self.overrides[s["id"]]] if s["id"] in self.overrides else None,
+                "stuck": stuck,
+            })
+        return out
+
+    def _sweep_pins(self, live: list[dict]) -> None:
+        """Clear pins PipeMix left behind: an exe in `pinned_apps` with no
+        override still holding it pinned. Covers both an app that reopened
+        under a new pid after `stop_sharing` couldn't reach it, and a
+        previous run's pins found at startup. Never raises."""
+        pinned = self.config.data["pinned_apps"]
+        if not pinned:
+            return
+        kept = {self._exe.get(pid) for pid in self.overrides}
+        changed = False
+        for s in live:
+            exe = s.get("exe")
+            if not exe or exe not in pinned or exe in kept:
+                continue
+            try:
+                self.backend.move_stream(s["id"], None)
+            except Exception as e:
+                log.warning("Failed to clear pin for %s: %s", exe, e)
+                continue
+            pinned.remove(exe)
+            changed = True
+        if changed:
+            self.config.save()
 
     @locked
     def route_stream(self, stream_id: int, ids: list[str] | None) -> None:
-        """Pin a stream to one device, or hand it back to the session with None."""
+        """Pin a stream to one device, or clear the pin with None — the app
+        then follows the machine default (the hub, while a session is up)."""
         devs = [d for d in (self.devices.get(i) for i in ids or []) if d and d.sink]
         # ponytail: one engine per session, so no per-app fan-out; add a second
         # engine per pinned app if routing one app to several outputs matters.
         if len(devs) > 1:
             raise BackendError("On Windows an app can be routed to one output at a time.")
 
-        target = devs[0].sink if devs else self.active_sink() or self.backend.get_default()
+        target = devs[0].sink if devs else None
         self.backend.move_stream(stream_id, target)
+        exe = self._exe.get(stream_id)
+        pinned = self.config.data["pinned_apps"]
         if devs:
             self.overrides[stream_id] = devs[0].id
+            if exe and exe not in pinned:
+                pinned.append(exe)
+                self.config.save()
         else:
             self.overrides.pop(stream_id, None)
+            if exe and exe in pinned:
+                pinned.remove(exe)
+                self.config.save()
         log.info("Manual route: stream %d → %s", stream_id, target)
 
     @locked
@@ -404,6 +478,10 @@ class Controller(SignalEmitter):
             self.session.devices = []
             self.targets.clear()
             self.overrides.clear()
+            try:
+                self._sweep_pins(self.backend.list_streams())
+            except Exception as e:
+                log.warning("Failed to sweep leftover per-app pins: %s", e)
             self.emit("devices-changed", list(self.devices.values()))
             self._set_state(SessionState.IDLE)
         except Exception as e:

@@ -41,6 +41,7 @@ export interface Stream {
   sink: string;
   mute: boolean;
   devices: string[] | null; // pinned device ids; null while following the session
+  stuck: boolean; // playing somewhere other than where it was routed — the app has to reopen its audio
 }
 
 export interface Preset {
