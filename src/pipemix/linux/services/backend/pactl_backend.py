@@ -19,9 +19,14 @@ from pipemix.linux.services.backend import BackendError, BackendHealth, BackendS
 
 log = logging.getLogger(__name__)
 
-# Delay the slowest leg gets; every other leg adds on top of it to line up with
-# it (see set_legs). High enough to survive a Bluetooth hiccup — tune by ear.
-LOOPBACK_LATENCY_MS = 60
+# Margin over the slowest device. Every leg gets this plus the
+# slowest device's latency; PipeWire subtracts each device's own latency from
+# latency_msec, so all outputs land together. The ring is a fixed delay line, not
+# a jitter buffer: this only has to cover one quantum (pinned to 1024 = 21.3 ms)
+# plus slack, so raising it buys nothing against Bluetooth hiccups.
+# ponytail: a clock.force-quantum above ~1440 (30 ms) empties the slowest leg's ring and it
+# plays late; raise this past that quantum if anyone forces one.
+LOOPBACK_LATENCY_MS = 30
 
 
 def _load(args: list[str]) -> int | None:
@@ -54,7 +59,8 @@ def _kind(sink: str) -> DeviceKind:
     name = sink.lower()
     if name.startswith("bluez_"):
         return DeviceKind.BLUETOOTH
-    if "hdmi" in name or "iec958" in name or "dp-" in name:
+    # A USB dongle's S/PDIF profile is still a USB device; a USB dock's HDMI stays HDMI.
+    if "hdmi" in name or "dp-" in name or ("iec958" in name and "usb" not in name):
         return DeviceKind.HDMI
     if "usb" in name:
         return DeviceKind.USB
@@ -211,7 +217,7 @@ class PactlBackend:
                 for p in (info.get("params") or {}).get("Latency") or []:
                     if name and p.get("direction") == "Input":
                         # ponytail: quantum term dropped; every sink reports 1 quantum, so it cancels
-                        lat[name] = p["minNs"] + p["minRate"] * 1_000_000_000 // 48000
+                        lat[name] = p.get("minNs", 0) + p.get("minRate", 0) * 1_000_000_000 // 48000
             return lat
         except Exception:
             log.debug("pw-dump output unparsable")
@@ -327,18 +333,21 @@ class PactlBackend:
         self.set_legs(sink, devices)
         return sink
 
-    def set_legs(self, sink: VirtualSink, devices: list[AudioDevice]) -> None:
-        """Make the hub feed exactly these outputs, touching only what changed."""
+    def set_legs(self, sink: VirtualSink, devices: list[AudioDevice]) -> set[str]:
+        """Make the hub feed exactly these outputs, touching only what changed.
+        Returns the targets that got a freshly loaded leg."""
         wanted = {d.sink for d in devices if d.sink}
+        self._drop_stale(sink)
         lat = self._latencies()
         # High-water mark: a slow device dropping out doesn't pull the rest forward,
         # so a Bluetooth flap never glitches the outputs that stayed.
         sink.slowest = max([sink.slowest, *(lat.get(t, 0) for t in wanted)])
 
+        # One delay for every leg: latency_msec is end-to-end, and PipeWire already
+        # takes each device's own latency out of it.
+        ms = LOOPBACK_LATENCY_MS + sink.slowest // 1_000_000
+        fresh = set()
         for target in wanted:
-            if not lat and target in sink.delays:
-                continue  # pw-dump failed transiently; don't disturb an already-aligned leg
-            ms = LOOPBACK_LATENCY_MS + (sink.slowest - lat.get(target, 0)) // 1_000_000
             if sink.delays.get(target) == ms:
                 continue
             module = _load([
@@ -346,19 +355,42 @@ class PactlBackend:
                 f"source={sink.name}.monitor",
                 f"sink={target}",
                 f"latency_msec={ms}",
-                f"sink_input_properties=media.name={sink.name}",
+                # Pinned: pipewire-pulse would ask for latency_msec/3, which drags the
+                # graph quantum up to its max. dont_move: an orphaned leg unloads itself
+                # instead of WirePlumber moving it onto the hub (an echo loop).
+                f"sink_input_properties=media.name={sink.name}\\ node.latency=1024/48000",
+                "source_output_properties=node.latency=1024/48000",
+                "sink_dont_move=true",
+                "source_dont_move=true",
             ])
             if module is None:
                 continue  # the old leg, if any, keeps playing
             if target in sink.legs:
                 self._unload(sink.legs[target])  # make before break
             sink.legs[target], sink.delays[target] = module, ms
+            fresh.add(target)
             log.info("%s now feeds %s at %dms", sink.name, target, ms)
 
         for target in set(sink.legs) - wanted:
             self._unload(sink.legs.pop(target))
             sink.delays.pop(target, None)
             log.info("%s no longer feeds %s", sink.name, target)
+        return fresh
+
+    def _drop_stale(self, sink: VirtualSink) -> dict[str, str] | None:
+        """Forget legs whose loopback is gone. pipewire-pulse reuses a self-unloaded
+        module's id, so an id not carrying this hub's loopback is never unloaded.
+        Returns the module args by id, or None when the list couldn't be read."""
+        rc, out, _ = _run(["pactl", "list", "short", "modules"])
+        if rc != 0:
+            return None  # can't tell; keep trusting the stored ids
+        mods = {r[0]: r[2] for r in (l.split("\t") for l in out.splitlines()) if len(r) >= 3}
+        for target, module in list(sink.legs.items()):
+            if not {f"source={sink.name}.monitor", f"sink={target}"} <= set(mods.get(str(module), "").split()):
+                del sink.legs[target]
+                sink.delays.pop(target, None)
+                log.info("%s lost its leg to %s", sink.name, target)
+        return mods
 
     def _unload(self, module: int) -> None:
         rc, _, err = _run(["pactl", "unload-module", str(module)])
@@ -368,10 +400,14 @@ class PactlBackend:
     def destroy_sink(self, sink: VirtualSink) -> None:
         """Safe to call when the sink is already gone — never raises."""
         log.info("Destroying %s", sink)
+        mods = self._drop_stale(sink)
         for module in list(sink.legs.values()):
             self._unload(module)
         sink.legs.clear()
-        self._unload(sink.module)
+        # After a pipewire-pulse restart the stored id may be someone else's. Match the
+        # name anywhere, as find_orphans does, so an orphaned loopback goes too.
+        if mods is None or sink.name in mods.get(str(sink.module), ""):
+            self._unload(sink.module)
 
     def find_orphans(self) -> list[VirtualSink]:
         """Modules a previous run left behind. Never raises."""
