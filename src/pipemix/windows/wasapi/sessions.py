@@ -3,9 +3,7 @@
 Sessions are per-endpoint, not global: an app playing to a Bluetooth headset
 does not show up when you only enumerate the default device, so every active
 render endpoint is enumerated and the results are deduped by PID. On Windows
-the PID *is* the stream identity — there is no sink-input index to replace it
-with, unlike the Linux backend this mirrors
-(`src/pipemix/linux/services/backend/pactl_backend.py`).
+the PID *is* the stream identity; there is no sink-input index.
 """
 
 from __future__ import annotations
@@ -23,15 +21,8 @@ log = logging.getLogger(__name__)
 
 
 def _stream_name(display_name: str | None, process_name: str | None, pid: int) -> str:
-    """Prefer the app's own display name; most apps never set one — that is
-    the common case — so the process image name is the real fallback, and a
-    bare PID is the last resort if even `psutil` couldn't find the process.
-    """
-    if display_name:
-        return display_name
-    if process_name:
-        return process_name
-    return f"pid {pid}"
+    """The app's display name, else its process name, else "pid {pid}"."""
+    return display_name or process_name or f"pid {pid}"
 
 
 @lru_cache(maxsize=64)
@@ -180,16 +171,3 @@ def set_stream_mute(pid: int, mute: bool) -> None:
         session.SimpleAudioVolume.SetMute(mute, IID_Empty)
     except Exception as e:
         raise BackendError(f"Failed to mute stream {pid}: {e}") from e
-
-
-def set_stream_volume(pid: int, volume: int) -> None:
-    from pycaw.constants import IID_Empty
-
-    session = _find_session(pid)
-    if session is None:
-        raise BackendError(f"No audio session found for pid {pid}")
-    vol = max(0, min(100, volume))
-    try:
-        session.SimpleAudioVolume.SetMasterVolume(vol / 100, IID_Empty)
-    except Exception as e:
-        raise BackendError(f"Failed to set volume of stream {pid}: {e}") from e

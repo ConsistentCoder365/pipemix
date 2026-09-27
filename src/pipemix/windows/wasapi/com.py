@@ -26,15 +26,13 @@ from comtypes import COMMETHOD, GUID, IUnknown
 AUDCLNT_SHAREMODE_SHARED = 0
 
 AUDCLNT_STREAMFLAGS_LOOPBACK            = 0x00020000
-AUDCLNT_STREAMFLAGS_EVENTCALLBACK       = 0x00040000
 AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
 # Lets a leg run at a rate and channel count that differ from what we feed it,
 # which is the whole reason "Bluetooth at 48k, speakers at 44.1k" is a non-problem.
 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      = 0x80000000
 
 # IAudioCaptureClient::GetBuffer flags
-AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY = 0x1
-AUDCLNT_BUFFERFLAGS_SILENT             = 0x2
+AUDCLNT_BUFFERFLAGS_SILENT = 0x2
 
 REFTIMES_PER_SEC = 10_000_000  # a REFERENCE_TIME is 100ns
 

@@ -5,24 +5,15 @@ The state machine: owns the SharingSession, reacts to endpoint hotplug, runs
 crash recovery, drives the backend, and pushes updates to the UI as signals.
 All business logic lives here; the UI only triggers and listens.
 
-Forked from `pipemix.linux.controller`. What changed and why:
+Differs from `pipemix.linux.controller`:
 
-- `GObject.Object` → `SignalEmitter` (no GLib on Windows).
-- `DeviceMonitor` comes from `wasapi.notify` and reports endpoint ids, not
-  MACs; there is no `on_property` (no Bluetooth battery plumbing here).
-- The whole MAC layer is gone. `sink_to_mac`, `path_to_mac`,
-  `resolve_bt_sinks` and the `_resolve_retry` chain existed because a
-  PipeWire sink name changes per session; a Windows endpoint id is stable
-  across reconnects, so `AudioDevice.id` *is* `AudioDevice.sink` and
-  `_on_connect` acts immediately. `refresh()` no longer merges anything:
-  `backend.list_outputs()` is already the whole truth.
-- New: leader re-election. In leader mode the source endpoint is a real
-  device that can vanish; `_on_disconnect` elects a survivor and rebuilds the
-  session on it. Hub mode has no leader, so this path never triggers there.
-- New: per-app capture in hub mode. While a hub session is up, a 1 s poll
-  (`_sync_apps`) hands `backend.set_app_routes` every app playing into the
-  hub with the outputs it wants, so one app can go to several outputs and
-  nothing is pinned. Leader mode keeps the per-app pin path.
+- `SignalEmitter` instead of `GObject.Object` (no GLib on Windows).
+- Endpoint ids are stable across reconnects, so there is no MAC layer or
+  `_resolve_retry` chain; `AudioDevice.id` *is* `AudioDevice.sink`.
+- Leader re-election: in leader mode `_on_disconnect` elects a survivor and
+  rebuilds the session on it when the source endpoint vanishes.
+- Hub-mode per-app capture poll (`_sync_apps`) reconciles `set_app_routes`
+  with whatever is actually playing into the hub.
 """
 
 from __future__ import annotations
@@ -133,25 +124,12 @@ class Controller(SignalEmitter):
     def clean_orphans(self) -> None:
         """Restore a default output stranded by a crash.
 
-        `backend.find_orphans()` always returns `[]` on Windows — nothing
-        leaks, there are no kernel modules to unload. The real hazard is
-        different: starting a session repoints the Windows default output,
-        and if the process dies before `stop_sharing` restores it, the user
-        is left hearing nothing with no clue why. `start_sharing` persists
-        `prev_default` to config before it changes the default, and
-        `stop_sharing` clears it after a clean restore — so a `prev_default`
-        still on disk here means the last run never got that far.
-
-        Beyond that specific crash trail, also self-heal whatever state the
-        user was actually left in: if nothing is running and Windows' default
-        is still our own hub (CABLE Input), there is no session left to blame
-        it on — put back whatever `restore_target` would have restored to.
+        Restores `prev_default` when it is still stranded on disk (persisted
+        by `start_sharing`, cleared by `stop_sharing`) — a crash trail. Else,
+        if no session is running and Windows' default is still our own hub
+        (CABLE Input) with nothing to blame it on, puts the default back.
         """
         try:
-            for sink in self.backend.find_orphans():
-                log.warning("Destroying orphaned sink: %s", sink.name)
-                self.backend.destroy_sink(sink)
-
             # Overrides are empty this early, so any app still pinned by a
             # previous run gets cleared here rather than waiting for streams().
             try:
@@ -357,11 +335,8 @@ class Controller(SignalEmitter):
         self._level_hub(sink.name, devices)
 
         self.backend.set_default(sink.name)
-        # Apps already follow the machine default we just changed, into the
-        # hub — no need to pin every one of them there too. Per-app routes
-        # are a *persisted* preference keyed by exe, not a live move: pinning
-        # everything here would survive this session and strand those apps
-        # on the hub the next time PipeMix isn't running.
+        # Apps follow the default into the hub; pinning them here would
+        # persist past this session.
         return sink
 
     def _retarget(self, devices: list[AudioDevice]) -> None:
@@ -575,9 +550,6 @@ class Controller(SignalEmitter):
 
     def _on_connect(self, device_id: str) -> None:
         log.info("Endpoint connected: %s", device_id)
-        # A Windows endpoint id is stable and `list_outputs()` already knows
-        # about it the moment it goes active, so there is no retry chain here
-        # — that lives in `wasapi.notify` instead, a much smaller one.
         self.refresh()
         if device_id in self.targets:
             self._rebuild()
@@ -639,8 +611,7 @@ class Controller(SignalEmitter):
         The leader is a real device and can vanish mid-session. Pick a
         survivor and stand a new session up on it — the fan-out has one
         capture source, and it cannot be swapped in place. Playback gaps for
-        roughly 200 ms; accepted per the plan. If nothing is left, stop
-        sharing entirely.
+        roughly 200 ms. If nothing is left, stop sharing entirely.
         """
         survivors = [
             d for d in (self.devices.get(t) for t in self.targets if t != self.backend.leader)
