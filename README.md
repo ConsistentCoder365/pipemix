@@ -62,6 +62,17 @@ sudo dpkg -i build/pipemix.deb
 The frontend has to be built first — `build_deb.py` refuses to package without
 it.
 
+### Windows installer
+
+On Windows, build the frontend first, install the Python dependencies and
+PyInstaller, and install Inno Setup 6, then run `python build_win.py`.
+
+The installer bundles [VB-CABLE](https://www.vb-cable.com/), VB-Audio's
+virtual audio driver. VB-CABLE is donationware, and all participations are
+welcome. Unless the driver is already installed, the finish page offers to
+install it, ticked by default, and there's a Start Menu shortcut to install it
+later. The driver needs administrator approval and may need a reboot.
+
 ## Command line
 
 The GUI is the default, but everything is reachable from a terminal:
