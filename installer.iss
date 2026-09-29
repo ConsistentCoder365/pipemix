@@ -60,7 +60,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Messages]
 ; Set here, not from [Code], so Inno sizes the label before placing the run
 ; checkboxes under it.
-FinishedLabel=Setup has finished installing [name] on your computer. The application may be launched by selecting the installed shortcuts.%n%nPipeMix uses VB-CABLE, a virtual audio driver by VB-Audio: www.vb-cable.com. VB-CABLE is donationware, all participations are welcome; you can donate or buy a license from VB-Audio if you find it useful. The driver needs administrator approval and may need a reboot. If you install it later from the Start Menu, relaunch PipeMix afterwards.
+FinishedLabel=Setup has finished installing [name] on your computer. The application may be launched by selecting the installed shortcuts.%n%nPipeMix uses VB-CABLE by VB-Audio (www.vb-cable.com), which is donationware. If it helps you, please donate. Installing it needs admin approval and may need a reboot.
 
 [Files]
 Source: "{#PipemixDistDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
@@ -74,7 +74,7 @@ Name: "{group}\Install VB-CABLE"; Filename: "{app}\VB-CABLE\VBCABLE_Setup_x64.ex
 [Run]
 ; The setup's manifest requires admin, so it needs shellexec to get a UAC
 ; prompt. Listed first and waited on so the driver is in before PipeMix starts.
-Filename: "{app}\VB-CABLE\VBCABLE_Setup_x64.exe"; WorkingDir: "{app}\VB-CABLE"; Description: "Install VB-CABLE, VB-Audio's virtual audio driver (needs admin approval)"; Flags: postinstall shellexec waituntilterminated skipifsilent; Check: not IsVBCableInstalled
+Filename: "{app}\VB-CABLE\VBCABLE_Setup_x64.exe"; WorkingDir: "{app}\VB-CABLE"; Description: "Install VB virtual audio driver (recommended, needs admin approval)"; Flags: postinstall shellexec waituntilterminated skipifsilent; Check: not IsVBCableInstalled
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -118,9 +118,13 @@ end;
 
 // Service name from the package's vbMmeCable64_win10.inf. Without this an
 // upgrade would offer, ticked, to reinstall a driver that is already there.
+// The service key outlives an uninstall of VB-CABLE, so count the live device
+// instances under Enum rather than testing that the key exists.
 function IsVBCableInstalled: Boolean;
+var
+  Count: Cardinal;
 begin
-  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\VBAudioVACMME');
+  Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum', 'Count', Count) and (Count > 0);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
