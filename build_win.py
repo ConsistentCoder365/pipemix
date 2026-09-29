@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import zipfile
 from pathlib import Path
 
 
@@ -38,6 +39,10 @@ def main():
     frontend_dist = project_root / "frontend" / "dist"
     spec_path = project_root / "pipemix.spec"
     installer_path = project_root / "installer.iss"
+    vb_cable_zip = project_root / "VBCABLE_Driver_Pack45.zip"
+    if not vb_cable_zip.is_file():
+        print(f"[ERROR] VB-CABLE package not found: {vb_cable_zip}")
+        sys.exit(1)
 
     # Single source of truth for the version; mirrors build_deb.py so the
     # .exe and the .deb can never drift apart on a release.
@@ -76,6 +81,15 @@ def main():
     if build_dir.exists():
         shutil.rmtree(build_dir)
 
+    vb_cable_dir = build_dir / "vbcable"
+    # Inno Setup can't read a zip, so it gets the extracted tree. The check
+    # matters because a missing setup exe still compiles into a broken installer.
+    with zipfile.ZipFile(vb_cable_zip) as package:
+        if "VBCABLE_Setup_x64.exe" not in package.namelist():
+            print("[ERROR] VB-CABLE archive does not contain VBCABLE_Setup_x64.exe")
+            sys.exit(1)
+        package.extractall(vb_cable_dir)
+
     dist_dir = build_dir / "dist"
     work_dir = build_dir / "work"
 
@@ -106,6 +120,7 @@ def main():
             f"/DMyAppVersion={version}",
             f"/DPipemixDistDir={exe_dir}",
             f"/DPipemixIconFile={icon_file}",
+            f"/DVBcableDir={vb_cable_dir}",
             f"/O{build_dir}",
             str(installer_path),
         ],

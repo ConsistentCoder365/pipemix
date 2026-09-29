@@ -5,9 +5,9 @@
 ; version has one source of truth, pyproject.toml, and must never be
 ; hand-typed here.
 ;
-; VB-CABLE is not bundled: VB-Audio's licence forbids redistribution without
-; a written agreement. PipeMix runs in mirror mode without it and says so at
-; first launch, so the finish page just points at the download instead.
+; VB-CABLE is bundled under VB-Audio's donationware terms
+; (https://vb-audio.com/Services/licensing.htm): the user must be able to see
+; it is VB-Audio's and that they can donate, hence the finish page text.
 
 #ifndef MyAppVersion
   #error MyAppVersion must be defined -- build via build_win.py, or pass /DMyAppVersion=x.y.z to ISCC directly
@@ -18,6 +18,10 @@
 
 #ifndef PipemixDistDir
   #error PipemixDistDir must be defined -- build via build_win.py, or pass /DPipemixDistDir=<path to the PyInstaller onedir output> to ISCC directly
+#endif
+
+#ifndef VBcableDir
+  #error VBcableDir must be defined -- build via build_win.py, or pass /DVBcableDir=<path to the extracted VB-CABLE package> to ISCC directly
 #endif
 
 #define MyAppName "PipeMix"
@@ -53,14 +57,24 @@ SetupIconFile={#PipemixIconFile}
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+; Set here, not from [Code], so Inno sizes the label before placing the run
+; checkboxes under it.
+FinishedLabel=Setup has finished installing [name] on your computer. The application may be launched by selecting the installed shortcuts.%n%nPipeMix uses VB-CABLE by VB-Audio (www.vb-cable.com), which is donationware. If it helps you, please donate. Installing it needs admin approval and may need a reboot.
+
 [Files]
 Source: "{#PipemixDistDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#VBcableDir}\*"; DestDir: "{app}\VB-CABLE"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{group}\Install VB-CABLE"; Filename: "{app}\VB-CABLE\VBCABLE_Setup_x64.exe"; WorkingDir: "{app}\VB-CABLE"
 
 [Run]
+; The setup's manifest requires admin, so it needs shellexec to get a UAC
+; prompt. Listed first and waited on so the driver is in before PipeMix starts.
+Filename: "{app}\VB-CABLE\VBCABLE_Setup_x64.exe"; WorkingDir: "{app}\VB-CABLE"; Description: "Install VB virtual audio driver (recommended, needs admin approval)"; Flags: postinstall shellexec waituntilterminated skipifsilent; Check: not IsVBCableInstalled
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -102,17 +116,19 @@ begin
   Exec(BootstrapperPath, '/silent /install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// Service name from the package's vbMmeCable64_win10.inf. Without this an
+// upgrade would offer, ticked, to reinstall a driver that is already there.
+// The service key outlives an uninstall of VB-CABLE, so count the live device
+// instances under Enum rather than testing that the key exists.
+function IsVBCableInstalled: Boolean;
+var
+  Count: Cardinal;
+begin
+  Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum', 'Count', Count) and (Count > 0);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep = ssPostInstall) and not IsWebView2Installed then
     InstallWebView2;
-end;
-
-procedure CurPageChanged(CurPageID: Integer);
-begin
-  if CurPageID = wpFinished then
-    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10 + #13#10 +
-      'PipeMix runs in mirror mode until VB-CABLE is installed, with a banner ' +
-      'saying so. For fully synced multi-output audio, get the free driver from ' +
-      'https://vb-audio.com/Cable/ and relaunch PipeMix.';
 end;
