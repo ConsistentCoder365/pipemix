@@ -30,7 +30,8 @@ export interface AudioDevice {
 export interface BackendStatus {
   health: BackendHealth;
   message: string;
-  // "native" | "hub" | "leader" — set by WasapiBackend.health(); absent only
+  // "native" (Linux) | "hub" / "leader" (Windows) | "aggregate" (macOS) — set by
+  // each backend's health(); absent only
   // from App.tsx's placeholder state before the first snapshot lands.
   engine?: string;
 }

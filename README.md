@@ -1,8 +1,9 @@
 # PipeMix
 
-Play the same audio through several outputs at once on Linux — laptop speakers
-and a Bluetooth headset together, two Bluetooth speakers in different rooms, or
-whatever combination you like — with a volume fader for each one.
+Play the same audio through several outputs at once on Linux, Windows or
+macOS — laptop speakers and a Bluetooth headset together, two Bluetooth
+speakers in different rooms, or whatever combination you like — with a volume
+fader for each one.
 
 <img width="880" height="660" alt="outputs" src="https://github.com/user-attachments/assets/b513daf2-a827-416c-a508-74c7d9da718b" />
 
@@ -72,6 +73,42 @@ virtual audio driver. VB-CABLE is donationware, and all participations are
 welcome. Unless the driver is already installed, the finish page offers to
 install it, ticked by default, and there's a Start Menu shortcut to install it
 later. The driver needs administrator approval and may need a reboot.
+
+### macOS
+
+Download `PipeMix-<version>.dmg` from the [releases][mac-releases], open it,
+and drag **PipeMix** into Applications. The build is not notarized, so the
+first launch needs right-click → **Open** (or run
+`xattr -dr com.apple.quarantine /Applications/PipeMix.app`).
+
+No driver is needed. PipeMix creates a Multi-Output Device (a stacked
+aggregate device in Core Audio) called **PipeMix**, makes it the default
+output while you share, and removes it again when you stop or quit. Each
+output stays at its own volume and is drift-corrected against a wired output
+when there is one.
+
+Differences from Linux:
+
+- **No per-app routing yet** — macOS has no way to move another app's
+  stream, so the Apps tab is hidden.
+- **Volume keys don't move the shared output** — a Multi-Output Device has
+  no volume of its own, so the master fader scales each output instead.
+- **No Bluetooth battery level.**
+
+The CLI is inside the bundle:
+`/Applications/PipeMix.app/Contents/MacOS/PipeMix --list`. Config lives in
+`~/Library/Application Support/PipeMix/`, logs in `~/Library/Logs/PipeMix/`.
+
+To build it yourself (Python 3.12+; Homebrew's Python may need
+`uv venv --python 3.13` if its `pyexpat` is broken):
+
+```sh
+npm --prefix frontend install && npm --prefix frontend run build
+python3 -m venv .venv && .venv/bin/pip install -e . pyinstaller
+.venv/bin/python build_mac.py      # → build/dist/PipeMix.app, build/PipeMix-<version>.dmg
+```
+
+[mac-releases]: https://github.com/ConsistentCoder365/pipemix/releases
 
 ## Command line
 
