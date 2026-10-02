@@ -42,7 +42,7 @@ class ConfigManager:
         self.path = path or _default_config_path()
         self.data: dict = {
             "devices": {}, "presets": {}, "last_preset": None, "prev_default": None,
-            "pinned_apps": [],
+            "pinned_apps": [], "master": None,
         }
         self.load()
 
@@ -66,6 +66,7 @@ class ConfigManager:
             "last_preset": raw.get("last_preset"),
             "prev_default": raw.get("prev_default"),
             "pinned_apps": raw.get("pinned_apps", []),
+            "master": raw.get("master"),  # last master level; only macOS keeps it yet
         }
 
     def save(self) -> None:

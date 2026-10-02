@@ -12,9 +12,14 @@ Data paths. frontend/dist ships under Contents/Resources, which is
 `sys._MEIPASS` in a BUNDLE build — the first place macos/app.py's `_roots()`
 looks.
 
-No pyobjc is needed by PipeMix itself (Core Audio is reached through ctypes),
-but pywebview's Cocoa backend pulls it in, and PyInstaller's pywebview hook
-collects it.
+Core Audio is reached through ctypes, plus pyobjc (which pywebview's Cocoa
+backend brings anyway) for CATapDescription and the volume-key monitor.
+build/_tapcopy.dylib is the per-app IOProc, compiled by build_mac.py; it
+lands next to tapcopy.py, where that module looks for it.
+
+NSAudioCaptureUsageDescription is what lets macOS ask for the System Audio
+Recording permission per-app routing needs; without it, taps stay silent
+and no prompt ever appears.
 """
 
 from pathlib import Path
@@ -23,6 +28,7 @@ project_root = Path(SPECPATH)
 src_dir = project_root / "src"
 frontend_dist = project_root / "frontend" / "dist"
 icon_file = project_root / "build" / "pipemix.icns"
+tapcopy = project_root / "build" / "_tapcopy.dylib"
 
 import tomllib
 with open(project_root / "pyproject.toml", "rb") as f:
@@ -31,9 +37,9 @@ with open(project_root / "pyproject.toml", "rb") as f:
 a = Analysis(
     [str(src_dir / "pipemix" / "macos" / "main.py")],
     pathex=[str(src_dir)],
-    binaries=[],
+    binaries=[(str(tapcopy), "pipemix/macos")],
     datas=[(str(frontend_dist), "frontend/dist")],
-    hiddenimports=["webview.platforms.cocoa"],
+    hiddenimports=["webview.platforms.cocoa", "PyObjCTools.AppHelper"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -77,5 +83,8 @@ app = BUNDLE(
         "LSMinimumSystemVersion": "12.0",
         "NSHighResolutionCapable": True,
         "LSApplicationCategoryType": "public.app-category.music",
+        "NSAudioCaptureUsageDescription":
+            "PipeMix captures an app's audio only when you route that app to "
+            "specific outputs, so it can play there instead.",
     },
 )

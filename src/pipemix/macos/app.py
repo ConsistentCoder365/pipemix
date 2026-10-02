@@ -4,7 +4,9 @@ PipeMix — GUI startup (macOS).
 pywebview picks its Cocoa backend (WKWebView) here, which must own the main
 thread — `webview.start()` is the only thing blocking, as on Windows. The
 Controller needs no run loop of its own: Core Audio notifications are
-detached onto the HAL's own thread (see `coreaudio._libs`).
+detached onto the HAL's own thread (see `coreaudio._libs`). The one thing
+that does need Cocoa's loop is the volume-key monitor, installed on the main
+thread once the app is running.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import webview
 
 from pipemix.macos.backend import CoreAudioBackend
 from pipemix.macos.controller import Controller
+from pipemix.macos.media_keys import MediaKeys
 from pipemix.linux.services.config.config_manager import ConfigManager
 from pipemix.linux.ui.api import Api
 from pipemix.linux.ui.bridge import Bridge
@@ -75,6 +78,16 @@ def run_gui() -> int:
     )
     bridge.attach(window)
 
+    # Not one of the shared Bridge's signals: only the Mac build moves master
+    # from outside the page.
+    controller.connect("master-changed", lambda _c, level: bridge._push("master", level))
+    keys = MediaKeys(controller.volume_key)
+
+    def started() -> None:
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(keys.install)
+        controller.start()
+
     def unwind() -> None:
         # Unwind routing before the process goes away: the hub is a real
         # device and would outlive us, still the default output. Safe to run
@@ -91,7 +104,7 @@ def run_gui() -> int:
     # start() enumerates devices and registers the hotplug listener, and its
     # first devices-changed emit needs the bridge already attached.
     try:
-        webview.start(controller.start, debug=dev)
+        webview.start(started, debug=dev)
     finally:
         unwind()
 

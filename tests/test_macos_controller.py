@@ -234,3 +234,115 @@ def test_no_per_app_routing(tmp_path: Path) -> None:
         raise AssertionError("route_stream should refuse on macOS")
     except BackendError:
         pass
+
+
+# -- Master level --
+
+def test_master_starts_at_100_and_is_remembered(tmp_path: Path) -> None:
+    ctrl = _ctrl(tmp_path)
+    assert ctrl.master_volume == 100
+    ctrl.set_master_volume(35)
+    ctrl.stop()
+
+    again = Controller(_backend(), ConfigManager(tmp_path / "config.json"), monitor=MagicMock())
+    assert again.master_volume == 35
+
+
+# -- Volume keys --
+
+def test_volume_keys_only_act_while_sharing(tmp_path: Path) -> None:
+    ctrl = _ctrl(tmp_path)
+    assert ctrl.volume_key("up", 100 / 16) is False
+
+
+def test_volume_keys_move_master_on_the_sixteenths_grid(tmp_path: Path) -> None:
+    b = _backend()
+    ctrl = _ctrl(tmp_path, b)
+    pushed = []
+    ctrl.connect("master-changed", lambda _c, v: pushed.append(v))
+    _share(ctrl, "a", "b")
+    ctrl.set_master_volume(50)
+
+    assert ctrl.volume_key("up", 100 / 16)
+    assert ctrl.master_volume == 56
+    ctrl.volume_key("down", 100 / 16)
+    assert ctrl.master_volume == 50
+    b.set_volume.assert_called_with(HUB, 50)
+    assert pushed == [56, 50]
+
+
+def test_mute_key_toggles_back_to_the_old_level(tmp_path: Path) -> None:
+    ctrl = _ctrl(tmp_path)
+    _share(ctrl, "a", "b")
+    ctrl.set_master_volume(60)
+    ctrl.volume_key("mute", 0)
+    assert ctrl.master_volume == 0
+    ctrl.volume_key("mute", 0)
+    assert ctrl.master_volume == 60
+
+
+# -- Per-app routing --
+
+def test_route_needs_a_session(tmp_path: Path) -> None:
+    ctrl = _ctrl(tmp_path)
+    try:
+        ctrl.route_stream(1, ["a"])
+        raise AssertionError("route_stream should refuse while idle")
+    except BackendError:
+        pass
+
+
+def test_route_to_some_outputs_then_back_to_all(tmp_path: Path) -> None:
+    b = _backend()
+    ctrl = _ctrl(tmp_path, b)
+    _share(ctrl, "a", "b")
+
+    ctrl.route_stream(42, ["b", "nope"])
+    b.set_app_routes.assert_called_with({42: ["b"]})
+
+    ctrl.route_stream(42, ["a", "b"])        # every output = following the session
+    b.set_app_routes.assert_called_with({})
+    assert ctrl.overrides == {}
+
+
+def test_a_dropped_output_leaves_the_apps_route(tmp_path: Path) -> None:
+    b = _backend()
+    b.list_streams.return_value = [{"id": 1, "name": "x"}, {"id": 2, "name": "y"}]
+    ctrl = _ctrl(tmp_path, b)
+    _share(ctrl, "a", "b", "c")
+    ctrl.route_stream(1, ["b", "c"])
+    ctrl.route_stream(2, ["b"])
+
+    ctrl._on_disconnect("b")
+
+    assert ctrl.overrides == {1: ["c"]}      # 2 had only b: it follows again
+    b.set_app_routes.assert_called_with({1: ["c"]})
+
+
+def test_stop_sharing_unroutes_every_app(tmp_path: Path) -> None:
+    b = _backend()
+    ctrl = _ctrl(tmp_path, b)
+    _share(ctrl, "a", "b")
+    ctrl.route_stream(1, ["a"])
+
+    ctrl.stop_sharing()
+
+    assert ctrl.overrides == {}
+    b.set_app_routes.assert_called_with({})
+
+
+def test_streams_carry_route_and_problem(tmp_path: Path) -> None:
+    b = _backend()
+    b.list_streams.return_value = [
+        {"id": 1, "name": "Music", "sink": HUB, "endpoint": HUB, "active": True, "mute": False},
+        {"id": 2, "name": "Safari", "sink": HUB, "endpoint": HUB, "active": True, "mute": False},
+    ]
+    b.route_problem.return_value = "waiting for you to allow System Audio Recording for PipeMix"
+    ctrl = _ctrl(tmp_path, b)
+    _share(ctrl, "a", "b")
+    ctrl.route_stream(1, ["a"])
+
+    music, safari = ctrl.streams()
+
+    assert music["devices"] == ["a"] and music["stuck"] and "allow" in music["hint"]
+    assert safari["devices"] is None and not safari["stuck"]

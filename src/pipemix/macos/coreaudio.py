@@ -64,6 +64,21 @@ AGG_MAIN_SUBDEVICE  = fourcc("amst")
 SUB_DRIFT           = fourcc("drft")
 CLASS_SUBDEVICE     = fourcc("asub")
 
+DEV_IOPROC_STREAM_USAGE = fourcc("suse")
+
+# Processes (macOS 14.2+)
+HW_PROCESS_LIST       = fourcc("prs#")
+HW_PID_TO_PROCESS     = fourcc("id2p")
+PROC_PID              = fourcc("ppid")
+PROC_BUNDLE_ID        = fourcc("pbid")
+PROC_RUNNING_OUTPUT   = fourcc("piro")
+PROC_DEVICES          = fourcc("pdv#")
+
+# CATapDescription.muteBehavior
+TAP_UNMUTED           = 0
+TAP_MUTED             = 1
+TAP_MUTED_WHEN_TAPPED = 2
+
 TRANSPORT_BUILTIN     = fourcc("bltn")
 TRANSPORT_AGGREGATE   = fourcc("grup")
 TRANSPORT_VIRTUAL     = fourcc("virt")
@@ -129,10 +144,22 @@ def _libs():
         c_uint32, POINTER(PropertyAddress), ListenerProc, c_void_p]
     ca.AudioHardwareCreateAggregateDevice.argtypes = [c_void_p, POINTER(c_uint32)]
     ca.AudioHardwareDestroyAggregateDevice.argtypes = [c_uint32]
-    for fn in ("AudioObjectGetPropertyDataSize", "AudioObjectGetPropertyData",
-               "AudioObjectSetPropertyData", "AudioObjectIsPropertySettable",
-               "AudioObjectAddPropertyListener", "AudioObjectRemovePropertyListener",
-               "AudioHardwareCreateAggregateDevice", "AudioHardwareDestroyAggregateDevice"):
+    ca.AudioDeviceCreateIOProcID.argtypes = [c_uint32, c_void_p, c_void_p, POINTER(c_void_p)]
+    ca.AudioDeviceDestroyIOProcID.argtypes = [c_uint32, c_void_p]
+    ca.AudioDeviceStart.argtypes = [c_uint32, c_void_p]
+    ca.AudioDeviceStop.argtypes = [c_uint32, c_void_p]
+    names = ["AudioObjectGetPropertyDataSize", "AudioObjectGetPropertyData",
+             "AudioObjectSetPropertyData", "AudioObjectIsPropertySettable",
+             "AudioObjectAddPropertyListener", "AudioObjectRemovePropertyListener",
+             "AudioHardwareCreateAggregateDevice", "AudioHardwareDestroyAggregateDevice",
+             "AudioDeviceCreateIOProcID", "AudioDeviceDestroyIOProcID",
+             "AudioDeviceStart", "AudioDeviceStop"]
+    # Process taps arrived in macOS 14.2; older systems simply lack the symbols.
+    if hasattr(ca, "AudioHardwareCreateProcessTap"):
+        ca.AudioHardwareCreateProcessTap.argtypes = [c_void_p, POINTER(c_uint32)]
+        ca.AudioHardwareDestroyProcessTap.argtypes = [c_uint32]
+        names += ["AudioHardwareCreateProcessTap", "AudioHardwareDestroyProcessTap"]
+    for fn in names:
         getattr(ca, fn).restype = c_int32
 
     cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
@@ -404,13 +431,17 @@ def set_mute(dev: int, mute: bool) -> bool:
 
 # ---------- Aggregate devices ----------
 
-def create_aggregate(agg_uid: str, agg_name: str, sub_uids: list[str], main_uid: str) -> int:
+def create_aggregate(agg_uid: str, agg_name: str, sub_uids: list[str], main_uid: str,
+                     *, private: bool = False, stacked: bool = True,
+                     taps: list[str] = ()) -> int:
     """
-    A stacked aggregate (a Multi-Output Device) over `sub_uids`, clocked by
-    `main_uid`, every other subdevice drift-corrected against it.
+    An aggregate over `sub_uids`, clocked by `main_uid`, every other
+    subdevice drift-corrected against it.
 
-    Not private: a private aggregate is invisible to every other process,
-    so it could not be the system default output — the whole point.
+    The session hub is stacked (a Multi-Output Device) and not private: a
+    private aggregate is invisible to every other process, so it could not
+    be the system default output. A per-app route is the opposite — private,
+    unstacked, and fed by `taps` (tap UUIDs) through an IOProc.
     """
     ca, _ = _libs()
     owned: list[int] = []
@@ -427,14 +458,21 @@ def create_aggregate(agg_uid: str, agg_name: str, sub_uids: list[str], main_uid:
             }))
             for u in sub_uids
         ]
-        desc = keep(_cf_dict({
+        fields = {
             "uid":        keep(_cf_str(agg_uid)),
             "name":       keep(_cf_str(agg_name)),
             "subdevices": keep(_cf_array(subs)),
             "master":     keep(_cf_str(main_uid)),
-            "private":    keep(_cf_num(0)),
-            "stacked":    keep(_cf_num(1)),
-        }))
+            "private":    keep(_cf_num(1 if private else 0)),
+            "stacked":    keep(_cf_num(1 if stacked else 0)),
+        }
+        if taps:
+            fields["taps"] = keep(_cf_array([
+                keep(_cf_dict({"uid": keep(_cf_str(t)), "drift": keep(_cf_num(1))}))
+                for t in taps
+            ]))
+            fields["tapautostart"] = keep(_cf_num(1))
+        desc = keep(_cf_dict(fields))
         out = c_uint32(0)
         status = ca.AudioHardwareCreateAggregateDevice(desc, byref(out))
         if status:
@@ -442,6 +480,131 @@ def create_aggregate(agg_uid: str, agg_name: str, sub_uids: list[str], main_uid:
         return out.value
     finally:
         _release(*owned)
+
+
+# ---------- Processes and taps (macOS 14.2+) ----------
+
+def taps_supported() -> bool:
+    ca, _ = _libs()
+    return hasattr(ca, "AudioHardwareCreateProcessTap")
+
+
+def process_ids() -> list[int]:
+    """AudioObjectIDs of every process that has opened audio."""
+    return _get_ids(SYSTEM_OBJECT, HW_PROCESS_LIST)
+
+
+def process_for_pid(pid: int) -> int | None:
+    try:
+        obj = _get(SYSTEM_OBJECT, HW_PID_TO_PROCESS, c_uint32, qualifier=c_int32(pid))
+    except CoreAudioError:
+        return None
+    return obj or None
+
+
+def process_pid(proc: int) -> int:
+    return _get(proc, PROC_PID, c_int32)
+
+
+def process_bundle_id(proc: int) -> str:
+    try:
+        return _get_str(proc, PROC_BUNDLE_ID)
+    except CoreAudioError:
+        return ""
+
+
+def process_is_playing(proc: int) -> bool:
+    try:
+        return bool(_get(proc, PROC_RUNNING_OUTPUT, c_uint32))
+    except CoreAudioError:
+        return False
+
+
+def process_output_devices(proc: int) -> list[int]:
+    try:
+        return _get_ids(proc, PROC_DEVICES, SCOPE_OUTPUT)
+    except CoreAudioError:
+        return []
+
+
+def create_process_tap(proc: int, mute: int, name: str) -> tuple[int, str]:
+    """A private stereo-mixdown tap of one process. Returns (tap id, tap UUID).
+
+    `mute` is a CATapMuteBehavior: TAP_MUTED silences the app everywhere
+    (that is all "mute" needs), TAP_MUTED_WHEN_TAPPED silences it only while
+    something reads the tap — so if PipeMix's IOProc stops, the app is heard
+    on its normal output again rather than lost.
+    """
+    import objc
+    ca, _ = _libs()
+    CATapDescription = objc.lookUpClass("CATapDescription")
+    desc = CATapDescription.alloc().initStereoMixdownOfProcesses_([proc])
+    desc.setMuteBehavior_(mute)
+    desc.setPrivate_(True)
+    desc.setName_(name)
+    out = c_uint32(0)
+    status = ca.AudioHardwareCreateProcessTap(objc.pyobjc_id(desc), byref(out))
+    if status:
+        raise CoreAudioError("AudioHardwareCreateProcessTap", status)
+    return out.value, str(desc.UUID().UUIDString())
+
+
+def destroy_process_tap(tap: int) -> None:
+    ca, _ = _libs()
+    status = ca.AudioHardwareDestroyProcessTap(tap)
+    if status:
+        raise CoreAudioError("AudioHardwareDestroyProcessTap", status)
+
+
+# ---------- IOProcs ----------
+
+def create_ioproc(dev: int, proc: int, client_data) -> int:
+    """Register the C function at address `proc` as an IOProc on `dev`."""
+    ca, _ = _libs()
+    proc_id = c_void_p(0)
+    status = ca.AudioDeviceCreateIOProcID(dev, proc, ctypes.cast(client_data, c_void_p)
+                                          if client_data is not None else None, byref(proc_id))
+    if status:
+        raise CoreAudioError("AudioDeviceCreateIOProcID", status)
+    return proc_id.value
+
+
+def only_last_inputs(dev: int, proc_id: int, keep: int) -> None:
+    """Switch off every input stream of `dev` for this IOProc but the last `keep`.
+
+    An aggregate's inputs are its subdevices' inputs followed by its taps.
+    Leaving a Bluetooth headset's microphone running would flip it into
+    hands-free mode (mono, telephone quality) and light the mic indicator,
+    all for audio this IOProc never reads.
+    """
+    ca, _ = _libs()
+    a = _addr(DEV_IOPROC_STREAM_USAGE, fourcc("inpt"))
+    size = c_uint32(0)
+    if ca.AudioObjectGetPropertyDataSize(dev, byref(a), 0, None, byref(size)):
+        return
+    buf = ctypes.create_string_buffer(size.value)
+    ctypes.memmove(buf, struct.pack("=Q", proc_id), 8)  # mIOProc is in/out
+    if ca.AudioObjectGetPropertyData(dev, byref(a), 0, None, byref(size), buf):
+        return
+    count = struct.unpack_from("=I", buf, 8)[0]
+    for i in range(count):
+        struct.pack_into("=I", buf, 12 + 4 * i, 1 if i >= count - keep else 0)
+    status = ca.AudioObjectSetPropertyData(dev, byref(a), 0, None, size.value, buf)
+    if status:
+        log.debug("Could not limit input streams on %d: %d", dev, status)
+
+
+def start_ioproc(dev: int, proc_id: int) -> None:
+    ca, _ = _libs()
+    status = ca.AudioDeviceStart(dev, proc_id)
+    if status:
+        raise CoreAudioError("AudioDeviceStart", status)
+
+
+def destroy_ioproc(dev: int, proc_id: int) -> None:
+    ca, _ = _libs()
+    ca.AudioDeviceStop(dev, proc_id)
+    ca.AudioDeviceDestroyIOProcID(dev, proc_id)
 
 
 def set_subdevices(agg: int, sub_uids: list[str], main_uid: str) -> None:

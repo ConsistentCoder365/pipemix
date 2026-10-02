@@ -72,6 +72,12 @@ def main() -> None:
     build.mkdir(exist_ok=True)
     make_icns(root / "data" / "icons" / "pipemix.png", build / "pipemix.icns")
 
+    # The per-app routing IOProc (real-time, so C), universal like the rest.
+    sys.path.insert(0, str(root / "src"))
+    from pipemix.macos.tapcopy import compile_to
+    compile_to(build / "_tapcopy.dylib")
+    print("+ compiled build/_tapcopy.dylib")
+
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--distpath", str(dist), "--workpath", str(build / "pyinstaller"),
         str(root / "pipemix-macos.spec"))

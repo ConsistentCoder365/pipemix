@@ -9,10 +9,15 @@ Forked from `pipemix.windows.controller`, minus what macOS has no use for:
 
 - No leader mode. The hub is always an aggregate device we own, so there is
   never a real device to re-elect when one drops.
-- No per-app routing (yet): no app poll, no overrides, no pins. `streams()`
-  is always empty and the page hides the Apps tab.
+- No pins. An app routed by hand is captured by a process tap only for as
+  long as PipeMix runs (see `apps.py`), so nothing persists to sweep up.
 - Crash recovery also has an orphan to clean: an aggregate device outlives
   the process that made it.
+
+And a few things only the Mac build does: the master level is remembered
+between runs (starting at 100, since each row already carries its device's
+own level), the volume keys drive it while sharing, and Bluetooth battery
+levels are polled from System Information.
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from pipemix.macos import battery
+
 from pipemix.models import AudioDevice, SessionState, SharingSession, VirtualSink
 from pipemix.linux.services.backend import BackendError, BackendHealth
 from pipemix.linux.services.config.config_manager import ConfigManager
@@ -33,6 +40,11 @@ if TYPE_CHECKING:
     from pipemix.macos.backend import CoreAudioBackend
 
 log = logging.getLogger(__name__)
+
+# How often the app list is reconciled with what is playing, and how often
+# Bluetooth battery levels are re-read.
+APP_POLL_S = 1.0
+BATTERY_POLL_S = 60.0
 
 
 def locked(fn):
@@ -66,7 +78,20 @@ class Controller(SignalEmitter):
         # Device UIDs we want back if they reconnect mid-session.
         self.targets: set[str] = set()
 
-        self.master_volume = 50
+        # Apps the user routed by hand (pid -> device UIDs, a subset of the
+        # session's outputs). Everything else follows the session.
+        self.overrides: dict[int, list[str]] = {}
+        self._last_streams: list[dict] | None = None
+
+        # Bluetooth address -> battery percent, refreshed in the background.
+        self.batteries: dict[str, int] = {}
+
+        self._polls: list[threading.Thread] = []
+        self._polls_stop = threading.Event()
+
+        saved = self.config.data.get("master")
+        self.master_volume = saved if isinstance(saved, int) else 100
+        self._unmuted_master: int | None = None
 
         # The page calls in on pywebview's thread while the notify worker
         # fires on its own, and both change which outputs the session feeds.
@@ -88,8 +113,23 @@ class Controller(SignalEmitter):
             log.error("Failed to start device monitor: %s", e)
 
         self.refresh()
+        self._polls_stop.clear()
+        self._poll("pipemix-apps", APP_POLL_S, self._sync_apps)
+        self._poll("pipemix-battery", BATTERY_POLL_S, self._read_batteries, now=True)
+
+    def _poll(self, name: str, every: float, fn, now: bool = False) -> None:
+        def run() -> None:
+            if now:
+                fn()
+            while not self._polls_stop.wait(every):
+                fn()
+        t = threading.Thread(target=run, name=name, daemon=True)
+        t.start()
+        self._polls.append(t)
 
     def stop(self) -> None:
+        # Never join the polls: either may be waiting on the routing lock.
+        self._polls_stop.set()
         # The hub, not the state: a session whose every output dropped sits in
         # REPAIRING, and its hub still has to go and the default come back.
         if self.session.sink:
@@ -97,6 +137,12 @@ class Controller(SignalEmitter):
                 self.stop_sharing()
             except Exception as e:
                 log.error("Failed to stop sharing during shutdown: %s", e)
+        try:
+            self.backend.clear_apps()  # unmute anything muted from the Apps tab
+        except Exception as e:
+            log.warning("Failed to release per-app captures: %s", e)
+        self.config.data["master"] = self.master_volume
+        self.config.save()
         self.monitor.stop()
 
     def clean_orphans(self) -> None:
@@ -143,6 +189,7 @@ class Controller(SignalEmitter):
             for dev in self.backend.list_outputs():
                 dev.name = self.config.device_name(dev.id, dev.name)
                 dev.volume = self._volume_of(dev.id, dev.sink)
+                dev.battery = self._battery_of(dev)
                 found[dev.id] = dev
 
             # Keep the ones the session is waiting on, so the page can show
@@ -159,6 +206,25 @@ class Controller(SignalEmitter):
             self.emit("streams-changed", self.streams())
         except Exception as e:
             log.error("Failed to refresh devices: %s", e)
+
+    def _battery_of(self, dev: AudioDevice) -> int | None:
+        address = battery.address_of(dev.id)
+        return self.batteries.get(address) if address else None
+
+    def _read_batteries(self) -> None:
+        """Re-read Bluetooth battery levels; push the page only when one moved."""
+        if not any(battery.address_of(i) for i in self.devices):
+            return
+        levels = battery.read()
+        self.batteries = levels
+        changed = False
+        for dev in self.devices.values():
+            level = self._battery_of(dev)
+            if dev.connected and level != dev.battery:
+                dev.battery = level
+                changed = True
+        if changed:
+            self.emit("devices-changed", list(self.devices.values()))
 
     def _volume_of(self, dev_id: str, sink: str | None) -> int:
         """Keep the volume we already know; otherwise ask the device, else 50%."""
@@ -187,6 +253,7 @@ class Controller(SignalEmitter):
 
     def set_master_volume(self, volume: int, unmute: bool = False) -> None:
         self.master_volume = volume
+        self._unmuted_master = None
 
         solo = self._solo()
         if solo:
@@ -204,6 +271,28 @@ class Controller(SignalEmitter):
                 self.backend.set_volume(target, volume)
             except Exception as e:
                 log.error("Failed to set master volume on %s: %s", target, e)
+
+    def volume_key(self, action: str, step: float) -> bool:
+        """A volume key was pressed. While sharing, the hub is the default
+        output and has no volume of its own, so the key moves master; returns
+        False otherwise, and macOS handles the key itself."""
+        if not self.session.is_active:
+            return False
+        if action == "mute":
+            if self._unmuted_master is None:
+                restore, level = self.master_volume, 0
+            else:
+                restore, level = None, self._unmuted_master
+            self.set_master_volume(level)
+            self._unmuted_master = restore
+        else:
+            base = self._unmuted_master if self._unmuted_master is not None else self.master_volume
+            delta = step if action == "up" else -step
+            # Snap to the grid, as macOS does, so up then down lands where it began.
+            level = round((round(base / step) * step + delta))
+            self.set_master_volume(max(0, min(100, level)))
+        self.emit("master-changed", self.master_volume)
+        return True
 
     def _solo(self) -> AudioDevice | None:
         """The one output the session is feeding, when there is only one."""
@@ -316,6 +405,8 @@ class Controller(SignalEmitter):
         self.backend.set_legs(self.session.sink, devices)
         self._level_hub(self.session.sink.name, devices)
         self._adopt(devices)
+        self._prune_overrides()
+        self._sync_apps()
 
     def _prepare(self, devices: list[AudioDevice]) -> None:
         """Unmute each output and put it back at its own level."""
@@ -336,11 +427,82 @@ class Controller(SignalEmitter):
         self._set_state(SessionState.ACTIVE)
 
     def streams(self) -> list[dict]:
-        """Per-app routing is not on macOS yet."""
-        return self.backend.list_streams()
+        """What is playing, each with the devices it was routed to (None: following)."""
+        live = self.backend.list_streams()
+        ids = {s["id"] for s in live}
+        for pid in [p for p in self.overrides if p not in ids]:
+            del self.overrides[pid]
+        out = []
+        for s in live:
+            handled = s["id"] in self.overrides or s.get("mute")
+            problem = self.backend.route_problem(s["id"], s.get("active")) if handled else None
+            out.append({
+                **s,
+                "devices": list(self.overrides[s["id"]]) if s["id"] in self.overrides else None,
+                "stuck": bool(problem),
+                "hint": problem,
+            })
+        return out
 
+    @locked
+    def _sync_apps(self) -> None:
+        """Push the app list to the page when it changed. Never raises."""
+        try:
+            out = self.streams()
+            if out != self._last_streams:
+                self._last_streams = out
+                self.emit("streams-changed", out)
+        except Exception as e:
+            log.warning("Failed to sync apps: %s", e)
+
+    def _prune_overrides(self) -> None:
+        """Keep each app's outputs inside the session; an app left with none
+        follows the session again."""
+        live = {d.id for d in self.session.devices}
+        changed = False
+        for pid, ids in list(self.overrides.items()):
+            kept = [i for i in ids if i in live]
+            if kept != ids:
+                changed = True
+                if kept:
+                    self.overrides[pid] = kept
+                else:
+                    del self.overrides[pid]
+        if changed:
+            self._apply_routes()
+
+    def _apply_routes(self) -> None:
+        try:
+            self.backend.set_app_routes(dict(self.overrides))
+        except BackendError as e:
+            log.error("Per-app routing failed: %s", e)
+
+    @locked
     def route_stream(self, stream_id: int, ids: list[str] | None) -> None:
-        raise BackendError("Per-app routing is not supported on macOS yet.")
+        """Send one app to some of the session's outputs, or (None) let it
+        follow the session again."""
+        if not self.session.is_active:
+            raise BackendError("Start sharing first — apps are routed to the outputs being shared.")
+        live = {d.id for d in self.session.devices}
+        devs = [i for i in ids or [] if i in live]
+        before = self.overrides.get(stream_id)
+        if devs and set(devs) != live:
+            self.overrides[stream_id] = devs
+        else:
+            # Every session output is just what following the session means.
+            self.overrides.pop(stream_id, None)
+        try:
+            # Returns at once: the taps are made on the backend's own thread,
+            # since the first one waits on macOS's permission prompt.
+            self.backend.set_app_routes(dict(self.overrides))
+        except BackendError:
+            if before:
+                self.overrides[stream_id] = before
+            else:
+                self.overrides.pop(stream_id, None)
+            raise
+        log.info("Manual route: app %d → %s", stream_id, self.overrides.get(stream_id) or "session")
+        self._sync_apps()
 
     @locked
     def stop_sharing(self) -> None:
@@ -354,12 +516,18 @@ class Controller(SignalEmitter):
                 except Exception as e:
                     log.warning("Could not restore original default output: %s", e)
 
+            # Routed apps go back to the default output before the hub goes.
+            self.overrides.clear()
+            self._apply_routes()
+
             if self.session.sink:
                 self.backend.destroy_sink(self.session.sink)
 
             self.session.sink = None
             self.session.devices = []
             self.targets.clear()
+            self.config.data["master"] = self.master_volume
+            self.config.save()
             self.emit("devices-changed", list(self.devices.values()))
             self._set_state(SessionState.IDLE)
         except Exception as e:
@@ -403,6 +571,7 @@ class Controller(SignalEmitter):
         except Exception as e:
             log.error("Failed to drop %s from the hub: %s", device_id, e)
         self.session.devices = remaining
+        self._prune_overrides()
         if remaining:
             self._level_hub(self.session.sink.name, remaining)
 

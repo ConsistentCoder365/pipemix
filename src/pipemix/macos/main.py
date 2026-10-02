@@ -19,6 +19,7 @@ from logging.handlers import RotatingFileHandler
 
 from pipemix.macos.backend import CoreAudioBackend
 from pipemix.macos.controller import Controller
+from pipemix.linux.services.backend import BackendError
 from pipemix.linux.services.config.config_manager import ConfigManager, default_log_dir
 
 log = logging.getLogger("pipemix.main")
@@ -114,12 +115,19 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="List all detected audio outputs")
     parser.add_argument("--share", metavar="IDS", help="Share to comma-separated device IDs")
     parser.add_argument("--refresh", action="store_true", help="Re-scan audio outputs (startup also removes a leftover PipeMix output)")
+    parser.add_argument("--apps", action="store_true", help="List apps playing audio, with their IDs")
+    parser.add_argument("--route", metavar="APP=IDS", action="append", default=[],
+                        help="With --share: send app APP (an ID from --apps) only to "
+                             "these '+'-separated device IDs. Repeatable.")
     parser.add_argument("--debug", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
     setup_logging(args.debug)
 
-    if not (args.cli or args.list or args.share or args.refresh):
+    if args.route and not args.share:
+        parser.error("--route only works together with --share")
+
+    if not (args.cli or args.list or args.share or args.refresh or args.apps):
         # Deferred: pywebview is a GUI-only dependency, and --list/--cli/
         # --share/--refresh must keep working on a machine that lacks it.
         from pipemix.macos.app import run_gui
@@ -151,6 +159,17 @@ def main() -> None:
         ctrl.refresh()
         sys.exit(0)
 
+    if args.apps:
+        streams = ctrl.streams()
+        print("\nPipeMix — apps playing audio:")
+        print("-" * 60)
+        for s in streams:
+            print(f"ID: {s['id']:<8} {s['name']:<30} on {s['endpoint'] or '?'}")
+        if not streams:
+            print("(nothing is playing)")
+        print("-" * 60)
+        sys.exit(0)
+
     ctrl.refresh()
     targets = []
     for dev_id in (i.strip() for i in args.share.split(",") if i.strip()):
@@ -169,6 +188,15 @@ def main() -> None:
         log.error("Failed to share audio: %s", e)
         sys.exit(1)
 
+    for spec in args.route:
+        app, _, ids = spec.partition("=")
+        try:
+            ctrl.route_stream(int(app), [i for i in ids.split("+") if i])
+        except (ValueError, BackendError) as e:
+            log.error("Could not route %r: %s", spec, e)
+            ctrl.stop_sharing()
+            sys.exit(1)
+
     log.info("Sharing active. Press Ctrl+C to stop sharing and exit.")
     stop_event = threading.Event()
 
@@ -178,6 +206,7 @@ def main() -> None:
         stop_event.set()
 
     signal.signal(signal.SIGINT, quit)
+    signal.signal(signal.SIGTERM, quit)
     stop_event.wait()
 
 

@@ -29,7 +29,7 @@ export default function App() {
   const [quitting, setQuitting] = useState(false);
   const [open, setOpen] = useState(false);
 
-  // macOS has no way to move another app's audio yet, so its backend
+  // A Mac older than 14.2 cannot tap another app's audio, so that backend
   // ("aggregate") has no Apps screen to offer.
   const perApp = health.engine !== "aggregate";
 
@@ -67,6 +67,9 @@ export default function App() {
           setHealth(payload as BackendStatus);
         } else if (event === "streams") {
           setStreams(payload as Stream[]);
+        } else if (event === "master") {
+          // A volume key moved it (macOS, while sharing).
+          setMaster(payload as number);
         }
       },
     };

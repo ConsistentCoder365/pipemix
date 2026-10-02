@@ -87,19 +87,30 @@ output while you share, and removes it again when you stop or quit. Each
 output stays at its own volume and is drift-corrected against a wired output
 when there is one.
 
-Differences from Linux:
+How it differs from Linux:
 
-- **No per-app routing yet** — macOS has no way to move another app's
-  stream, so the Apps tab is hidden.
-- **Volume keys don't move the shared output** — a Multi-Output Device has
-  no volume of its own, so the master fader scales each output instead.
-- **No Bluetooth battery level.**
+- **Per-app routing uses process taps** (macOS 14.2+). Routing an app to
+  some of the shared outputs captures it, mutes it at the source and plays
+  it there instead. The first time, macOS asks to allow **System Audio
+  Recording** for PipeMix; until you answer, routing waits. If you said no,
+  turn it on in System Settings → Privacy & Security → Screen & System Audio
+  Recording. Apps you don't route are never captured. Mute in the Apps tab
+  works the same way.
+- **Volume keys move PipeMix's master fader** while you share, since a
+  Multi-Output Device has no volume of its own. macOS still shows its
+  "unavailable" bezel; the fader in the window is what moves. Master starts
+  at 100 and is remembered between runs.
+- **Bluetooth battery levels** come from System Information, refreshed about
+  once a minute.
 
 The CLI is inside the bundle:
-`/Applications/PipeMix.app/Contents/MacOS/PipeMix --list`. Config lives in
+`/Applications/PipeMix.app/Contents/MacOS/PipeMix --list`. On macOS it also
+has `--apps` (what is playing, with IDs) and `--route APP=ID+ID` to use with
+`--share`. Config lives in
 `~/Library/Application Support/PipeMix/`, logs in `~/Library/Logs/PipeMix/`.
 
-To build it yourself (Python 3.12+; Homebrew's Python may need
+To build it yourself (Python 3.12+ and the Xcode command-line tools, which
+compile the small C helper per-app routing uses; Homebrew's Python may need
 `uv venv --python 3.13` if its `pyexpat` is broken):
 
 ```sh

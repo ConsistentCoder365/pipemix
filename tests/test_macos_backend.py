@@ -111,7 +111,8 @@ def test_master_scales_each_leg_and_rows_keep_their_own_level(hal: FakeHAL) -> N
     assert hal.vol("spk") == 0.4
     assert hal.vol("bt") == 0.2
     assert b.get_volume("spk") == 80     # the row still reads its own level
-    assert b.get_volume(HUB_UID) == 50
+    assert b.get_volume(sink.name) == 50
+    assert sink.name.startswith(HUB_UID + ".")
 
     b.set_volume("bt", 100)              # a row moves under the master
     assert hal.vol("bt") == 0.5
@@ -152,7 +153,7 @@ def test_failed_live_update_rebuilds_and_keeps_the_default(hal: FakeHAL) -> None
 
     assert hal.hub()[1] == ["spk", "bt"]
     assert hal.default == sink.module
-    assert hal.uid(hal.default) == HUB_UID
+    assert hal.uid(hal.default) == sink.name
 
 
 def test_create_replaces_a_leftover_hub(hal: FakeHAL) -> None:
