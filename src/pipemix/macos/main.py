@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -131,7 +132,14 @@ def main() -> None:
         # Deferred: pywebview is a GUI-only dependency, and --list/--cli/
         # --share/--refresh must keep working on a machine that lacks it.
         from pipemix.macos.app import run_gui
-        sys.exit(run_gui())
+        code = run_gui()
+        # run_gui() has already unwound routing. Exit without waiting on
+        # other threads: pywebview answers each JS call on a non-daemon
+        # thread that waits on the (now finished) Cocoa loop to deliver its
+        # result, so after a quit from the page Python's shutdown would join
+        # those threads forever — and the app would block a Mac shutdown.
+        logging.shutdown()
+        os._exit(code)
 
     ctrl = Controller(CoreAudioBackend(), ConfigManager())
 
