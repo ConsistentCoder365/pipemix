@@ -76,7 +76,7 @@ later. The driver needs administrator approval and may need a reboot.
 
 ### macOS
 
-Download `PipeMix-<version>.dmg` from the [releases][mac-releases], open it,
+Download `PipeMix-<version>.dmg` from the [latest release][releases], open it,
 and drag **PipeMix** into Applications. The build is not notarized, so the
 first launch needs right-click → **Open** (or run
 `xattr -dr com.apple.quarantine /Applications/PipeMix.app`).
@@ -119,7 +119,6 @@ python3 -m venv .venv && .venv/bin/pip install -e . pyinstaller
 .venv/bin/python build_mac.py      # → build/dist/PipeMix.app, build/PipeMix-<version>.dmg
 ```
 
-[mac-releases]: https://github.com/ConsistentCoder365/pipemix/releases
 
 ## Command line
 
