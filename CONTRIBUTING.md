@@ -89,11 +89,10 @@ with a test. UI-only changes usually don't need one.
 ## Pull requests
 
 - One change per PR, and a branch off `main`.
-- Say what you tested it on — the hardware matters here more than usual.
+- Say what you tested it on — the hardware matters A LOT.
 - Frontend changes: run `npm --prefix frontend run build` to make sure `tsc`
   is happy. Don't commit `frontend/dist/`.
-- Match the surrounding style. There's no formatter or linter configured, and
-  adding one isn't a small change — raise it as an issue first.
+- Match the surrounding style.
 
 ## License
 
